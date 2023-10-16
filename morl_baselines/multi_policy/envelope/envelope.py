@@ -5,7 +5,7 @@ Code modified to fit the MoDMSE environment
 import copy
 import os
 from typing import List, Optional, Union
-from typing_extensions import override
+
 from time import sleep
 import json
 import gymnasium as gym
@@ -15,21 +15,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
-
-from morl_baselines.common.buffer import ReplayBuffer
-from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
-from morl_baselines.common.networks import NatureCNN, mlp
-from morl_baselines.common.prioritized_buffer import PrioritizedReplayBuffer
-from morl_baselines.common.utils import (
-    equally_spaced_weights,
-    get_grad_norm,
-    layer_init,
-    linearly_decaying_value,
+from morl_baselines.common.evaluation import (
     log_all_multi_policy_metrics,
     log_episode_info,
-    polyak_update,
-    random_weights,
 )
+from morl_baselines.common.buffer import ReplayBuffer
+from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
+from morl_baselines.common.networks import NatureCNN, mlp, get_grad_norm, layer_init, polyak_update
+from morl_baselines.common.prioritized_buffer import PrioritizedReplayBuffer
+from morl_baselines.common.utils import linearly_decaying_value
+from morl_baselines.common.weights import equally_spaced_weights, random_weights
 import wandb
 
 
@@ -209,15 +204,17 @@ class Envelope(MOPolicy, MOAgent):
 
         self.rand = True
 
-        obs = self.env.obs_to_numpy(self.env.get_observation())
+        obs = self.env.obs_to_numpy(self.env._get_obs())
 
-        self.observation_shape_schedule = obs[0].shape
-        self.observation_shape_ticket = obs[1].shape
+        self.obs_shape_distribution = obs[0].shape
+        self.obs_shape_chosen_val = obs[1].shape
+        self.obs_shape_graph = obs[2].shape
 
         if self.per:
             self.replay_buffer = PrioritizedReplayBuffer(
-                self.observation_shape_schedule,
-                self.observation_shape_ticket,
+                self.obs_shape_distribution,
+                self.obs_shape_chosen_val,
+                self.obs_shape_graph,
                 action_dim=1,
                 rew_dim=self.reward_dim,
                 max_size=buffer_size,
@@ -236,7 +233,7 @@ class Envelope(MOPolicy, MOAgent):
         if log:
             self.setup_wandb(project_name, experiment_name, wandb_entity)
 
-    @override
+
     def get_config(self):
         return {
             "env_id": self.env.unwrapped.spec.id,
@@ -276,8 +273,7 @@ class Envelope(MOPolicy, MOAgent):
         self.q_net.save_weights(save_dir + "q_net_")
         self.target_q_net.save_weights(save_dir + "target_q_net_")
 
-        saved_params = {}
-        saved_params["q_net_optimizer_state_dict"] = self.q_optim.state_dict()
+        saved_params = {"q_net_optimizer_state_dict": self.q_optim.state_dict()}
         if save_replay_buffer:
             saved_params["replay_buffer"] = self.replay_buffer
         filename = "envelope_params"
@@ -297,36 +293,17 @@ class Envelope(MOPolicy, MOAgent):
         if load_replay_buffer and "replay_buffer" in params:
             self.replay_buffer = params["replay_buffer"]
 
-    def unpack(self, obs):
-        # We split the obs into the schedule and the ticket list
-        # obs_schedule is the whole obs except the last 15 elements
-        obs_schedule = obs[:-15]
-        # obs_ticket_list is the last 15 elements of obs
-        obs_ticket_list = obs[-15:]
-        # We reshape the schedule
-        obs_schedule = obs_schedule.reshape((5, 336, 3))
-        # We put the obs back into a dict
-        obs = {"schedule": obs_schedule, "ticket_list": obs_ticket_list}
-        return obs
-    
-    def unpack_tolist(self, obs_vec):
-        final = []
-        for obs in obs_vec:
-            final.append(self.unpack(obs))
-        return final
-
-    def repeat_list(self, list, n):
-        repeated_list = [item for item in list for _ in range(n)]
-        return repeated_list
 
     def obs_to_tensor(self, obs):
-        obs_schedule = obs["schedule"]
-        obs_ticket_list = obs["ticket_list"]
+        obs_distribution = obs["validator_distribution"]
+        obs_chosen = obs["chosen_val"]
+        obs_graph = obs["adj_graph"]
 
-        obs_schedule = th.tensor(obs_schedule).float().to(self.device)
-        obs_ticket_list = th.tensor(obs_ticket_list).float().to(self.device)
+        obs_distribution = th.tensor(obs_distribution).float().to(self.device)
+        obs_chosen = th.tensor(obs_chosen).float().to(self.device)
+        obs_graph = th.tensor(obs_graph).float().to(self.device)
 
-        obs = {"schedule": obs_schedule, "ticket_list": obs_ticket_list}
+        obs = (obs_distribution, obs_chosen, obs_graph)
         return obs
 
     def obs_list_to_tensor(self, obs_list):
@@ -338,27 +315,33 @@ class Envelope(MOPolicy, MOAgent):
     def __sample_batch_experiences(self):
         return self.replay_buffer.sample(self.batch_size, to_tensor=True, device=self.device)
 
-    @override
+
     def update(self):
         critic_losses = []
         for g in range(self.gradient_updates):
             if self.per:
                 (
-                    b_obs_schedule,
-                    b_obs_ticket,
+                    b_obs_distribution,
+                    b_obs_chosen,
+                    b_obs_graph,
                     b_actions,
                     b_rewards,
-                    b_next_obs_schedule,
-                    b_next_obs_ticket,
+                    b_next_obs_distribution,
+                    b_next_obs_chosen,
+                    b_next_obs_graph,
                     b_dones,
                     b_inds,
                 ) = self.__sample_batch_experiences()
             else:
                 (
-                    b_obs,
+                    b_obs_distribution,
+                    b_obs_chosen,
+                    b_obs_graph,
                     b_actions,
                     b_rewards,
-                    b_next_obs,
+                    b_next_obs_distribution,
+                    b_next_obs_chosen,
+                    b_next_obs_graph,
                     b_dones,
                 ) = self.__sample_batch_experiences()
 
@@ -367,24 +350,26 @@ class Envelope(MOPolicy, MOAgent):
                 .float()
                 .to(self.device)
             )  # sample num_sample_w random weights
-            w = sampled_w.repeat_interleave(b_obs_schedule.size(0), 0)  # repeat the weights for each sample
-            b_obs_schedule, b_obs_ticket, b_actions, b_rewards, b_next_obs_schedule, b_next_obs_ticket, b_dones = (
-                b_obs_schedule.repeat(self.num_sample_w, 1, 1, 1),
-                b_obs_ticket.repeat(self.num_sample_w, 1),
+            w = sampled_w.repeat_interleave(b_obs_distribution.size(0), 0)  # repeat the weights for each sample
+            b_obs_distribution, b_obs_chosen, b_obs_graph, b_actions, b_rewards, b_next_obs_distribution, b_next_obs_chosen, b_next_obs_graph, b_dones = (
+                b_obs_distribution.repeat(self.num_sample_w, 1),
+                b_obs_chosen.repeat(self.num_sample_w, 1),
+                b_obs_graph.repeat(self.num_sample_w, 1, 1),
                 b_actions.repeat(self.num_sample_w, 1),
                 b_rewards.repeat(self.num_sample_w, 1),
-                b_next_obs_schedule.repeat(self.num_sample_w, 1, 1, 1),
-                b_next_obs_ticket.repeat(self.num_sample_w, 1),
+                b_next_obs_distribution.repeat(self.num_sample_w, 1),
+                b_next_obs_chosen.repeat(self.num_sample_w, 1),
+                b_next_obs_graph.repeat(self.num_sample_w, 1, 1),
                 b_dones.repeat(self.num_sample_w, 1),
             )
             with th.no_grad():
                 if self.envelope:
-                    target = self.envelope_target(b_next_obs_schedule, b_next_obs_ticket, w, sampled_w)
+                    target = self.envelope_target(b_next_obs_distribution, b_next_obs_chosen, b_next_obs_graph, w, sampled_w)
                 else:
-                    target = self.ddqn_target(b_next_obs, w)
+                    target = self.ddqn_target(b_next_obs_distribution, w)
                 target_q = b_rewards + (1 - b_dones) * self.gamma * target
 
-            q_values = self.q_net(b_obs_schedule, b_obs_ticket, w)
+            q_values = self.q_net(b_next_obs_distribution, b_next_obs_chosen, b_next_obs_graph, w)
             q_value = q_values.gather(
                 1,
                 b_actions.long().reshape(-1, 1, 1).expand(q_values.size(0), 1, q_values.size(2)),
@@ -453,18 +438,22 @@ class Envelope(MOPolicy, MOAgent):
             if self.per:
                 wandb.log({"metrics/mean_priority": np.mean(priority)})
 
-    @override
-    def eval(self, obs_schedule: np.ndarray, obs_ticket: np.ndarray, w: np.ndarray) -> int:
-        obs_schedule = th.as_tensor(obs_schedule).float().to(self.device)
-        obs_ticket = th.as_tensor(obs_ticket).float().to(self.device)
-        w = th.as_tensor(w).float().to(self.device)
-        return self.max_action(obs_schedule, obs_ticket, w)
 
-    def act(self, obs_schedule: th.Tensor, obs_ticket: th.Tensor, w: th.Tensor) -> int:
+    def eval(self, obs_distribution: np.ndarray, obs_chosen: np.ndarray, obs_graph: np.ndarray, w: np.ndarray) -> int:
+        obs_distribution = th.as_tensor(obs_distribution).float().to(self.device)
+        obs_chosen = th.as_tensor(obs_chosen).float().to(self.device)
+        obs_graph = th.as_tensor(obs_graph).float().to(self.device)
+
+        w = th.as_tensor(w).float().to(self.device)
+        return self.max_action(obs_distribution, obs_chosen, obs_graph, w)
+
+    def act(self, obs_distribution: th.Tensor, obs_chosen: th.Tensor, obs_graph: th.Tensor, w: th.Tensor) -> int:
         """Epsilon-greedily select an action given an observation and weight.
 
         Args:
-            obs: observation
+            obs_distribution: observation
+            obs_chosen: observation
+            obs_graph: observation
             w: weight vector
 
         Returns: an integer representing the action to take.
@@ -474,20 +463,23 @@ class Envelope(MOPolicy, MOAgent):
             return self.env.action_space.sample_legal_action(self.env.state)
         else:
             self.rand = False
-            return self.max_action(obs_schedule, obs_ticket, w)
+            return self.max_action(obs_distribution, obs_chosen, obs_graph, w)
 
     @th.no_grad()
-    def max_action(self, obs_schedule: th.Tensor, obs_ticket: th.Tensor, w: th.Tensor) -> int:
-        """Select the action with the highest Q-value given an observation and weight.
+    def max_action(self, obs_distribution: th.Tensor, obs_chosen: th.Tensor, obs_graph: th.Tensor, w: th.Tensor) -> int:
+        """
+        Select the action with the highest Q-value given an observation and weight.
 
         Args:
-            obs: observation
+            obs_distribution: observation
+            obs_chosen: observation
+            obs_graph: observation
             w: weight vector
 
         Returns: the action with the highest Q-value.
         """
 
-        q_values = self.q_net(obs_schedule, obs_ticket, w)
+        q_values = self.q_net(obs_distribution, obs_chosen, obs_graph, w)
         scalarized_q_values = th.einsum("r,bar->ba", w, q_values)
 
         if self.action_masking:
@@ -500,24 +492,27 @@ class Envelope(MOPolicy, MOAgent):
         return max_act.detach().item()
 
     @th.no_grad()
-    def envelope_target(self, obs_schedule: th.Tensor, obs_ticket: th.Tensor, w: th.Tensor, sampled_w: th.Tensor) -> th.Tensor:
+    def envelope_target(self, obs_distribution: th.Tensor, obs_chosen: th.Tensor, obs_graph: th.Tensor, w: th.Tensor, sampled_w: th.Tensor) -> th.Tensor:
         """Computes the envelope target for the given observation and weight.
 
         Args:
-            obs: current observation.
+            obs_distribution: current observation.
+            obs_chosen: current observation.
+            obs_graph: current observation.
             w: current weight vector.
             sampled_w: set of sampled weight vectors (>1!).
 
         Returns: the envelope target.
         """
         # Repeat the weights for each sample
-        W = sampled_w.unsqueeze(0).repeat(obs_schedule.size(0), 1, 1)
+        W = sampled_w.unsqueeze(0).repeat(obs_distribution.size(0), 1, 1)
         # Repeat the observations for each sampled weight
-        next_obs_schedule = obs_schedule.unsqueeze(1).repeat(1, sampled_w.size(0), 1, 1, 1)
-        next_obs_ticket = obs_ticket.unsqueeze(1).repeat(1, sampled_w.size(0), 1)
+        next_obs_distribution = obs_distribution.unsqueeze(1).repeat(1, sampled_w.size(0), 1)
+        next_obs_chosen = obs_chosen.unsqueeze(1).repeat(1, sampled_w.size(0), 1)
+        next_obs_graph = obs_graph.unsqueeze(1).repeat(1, sampled_w.size(0), 1, 1)
 
         # Batch size X Num sampled weights X Num actions X Num objectives
-        next_q_values = self.q_net(next_obs_schedule, next_obs_ticket, W).view(obs_schedule.size(0), sampled_w.size(0), self.action_dim, self.reward_dim)
+        next_q_values = self.q_net(next_obs_distribution, next_obs_chosen, next_obs_graph, W).view(obs_distribution.size(0), sampled_w.size(0), self.action_dim, self.reward_dim)
         # Scalarized Q values for each sampled weight
         scalarized_next_q_values = th.einsum("br,bwar->bwa", w, next_q_values)
         # Max Q values for each sampled weight
@@ -526,8 +521,8 @@ class Envelope(MOPolicy, MOAgent):
         pref = th.argmax(max_q, dim=1)
 
         # MO Q-values evaluated on the target network
-        next_q_values_target = self.target_q_net(next_obs_schedule, next_obs_ticket, W).view(
-            obs_schedule.size(0), sampled_w.size(0), self.action_dim, self.reward_dim
+        next_q_values_target = self.target_q_net(next_obs_distribution, next_obs_chosen, next_obs_graph, W).view(
+            obs_distribution.size(0), sampled_w.size(0), self.action_dim, self.reward_dim
         )
 
         # Index the Q-values for the max actions
@@ -1060,4 +1055,4 @@ class Envelope(MOPolicy, MOAgent):
             num_episodes += 1
             self.num_episodes += 1
             terminated, truncated = False, False
-            scheduling += 1 
+            scheduling += 1
