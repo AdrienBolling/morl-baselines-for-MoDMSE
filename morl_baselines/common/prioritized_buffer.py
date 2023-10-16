@@ -86,8 +86,9 @@ class PrioritizedReplayBuffer:
 
     def __init__(
         self,
-        obs_shape_schedule,
-        obs_shape_ticket,
+        obs_shape_distribution,
+        obs_shape_chosen,
+        obs_shape_graph,
         action_dim = 1,
         rew_dim=5,
         max_size=100000,
@@ -114,10 +115,12 @@ class PrioritizedReplayBuffer:
             0,
             0,
         )
-        self.obs_schedule = np.zeros((max_size,) + (obs_shape_schedule), dtype=obs_dtype)
-        self.obs_ticket = np.zeros((max_size,) + (obs_shape_ticket), dtype=obs_dtype)
-        self.next_obs_schedule = np.zeros((max_size,) + (obs_shape_schedule), dtype=obs_dtype)
-        self.next_obs_ticket = np.zeros((max_size,) + (obs_shape_ticket), dtype=obs_dtype)
+        self.obs_distribution = np.zeros((max_size,) + (obs_shape_distribution), dtype=obs_dtype)
+        self.obs_chosen = np.zeros((max_size,) + (obs_shape_chosen), dtype=obs_dtype)
+        self.obs_graph = np.zeros((max_size,) + (obs_shape_graph), dtype=obs_dtype)
+        self.next_obs_distribution = np.zeros((max_size,) + (obs_shape_distribution), dtype=obs_dtype)
+        self.next_obs_chosen = np.zeros((max_size,) + (obs_shape_chosen), dtype=obs_dtype)
+        self.next_obs_graph = np.zeros((max_size,) + (obs_shape_graph), dtype=obs_dtype)
         self.actions = np.zeros((max_size, action_dim), dtype=action_dtype)
         self.rewards = np.zeros((max_size, rew_dim), dtype=np.float32)
         self.dones = np.zeros((max_size, 1), dtype=np.float32)
@@ -125,7 +128,7 @@ class PrioritizedReplayBuffer:
         self.tree = SumTree(max_size)
         self.min_priority = min_priority
 
-    def add(self, obs_schedule, obs_ticket, action, reward, next_obs_schedule, next_obs_ticket, done, priority=None):
+    def add(self, obs_distribution, obs_chosen, obs_graph, action, reward, next_obs_distribution, next_obs_chosen, next_obs_graph, done, priority=None):
         """Add a new experience to the buffer.
 
         Args:
@@ -137,10 +140,12 @@ class PrioritizedReplayBuffer:
             priority: Priority of the new experience
 
         """
-        self.obs_schedule[self.ptr] = np.array(obs_schedule).copy()
-        self.obs_ticket[self.ptr] = np.array(obs_ticket).copy()
-        self.next_obs_schedule[self.ptr] = np.array(next_obs_schedule).copy()
-        self.next_obs_ticket[self.ptr] = np.array(next_obs_ticket).copy()
+        self.obs_distribution[self.ptr] = np.array(obs_distribution).copy()
+        self.obs_chosen[self.ptr] = np.array(obs_chosen).copy()
+        self.obs_graph[self.ptr] = np.array(obs_graph).copy()
+        self.next_obs_distribution[self.ptr] = np.array(next_obs_distribution).copy()
+        self.next_obs_chosen[self.ptr] = np.array(next_obs_chosen).copy()
+        self.next_obs_graph[self.ptr] = np.array(next_obs_graph).copy()
         self.actions[self.ptr] = np.array(action).copy()
         self.rewards[self.ptr] = np.array(reward).copy()
         self.dones[self.ptr] = np.array(done).copy()
@@ -164,8 +169,9 @@ class PrioritizedReplayBuffer:
         idxes = self.tree.sample(batch_size)
 
         experience_tuples = (
-            self.obs_schedule[idxes],
-            self.obs_ticket[idxes],
+            self.obs_distribution[idxes],
+            self.obs_chosen[idxes],
+            self.obs_graph[idxes],
             self.actions[idxes],
             self.rewards[idxes],
             self.next_obs_schedule[idxes],
@@ -190,9 +196,9 @@ class PrioritizedReplayBuffer:
         """
         idxes = self.tree.sample(batch_size)
         if to_tensor:
-            return th.tensor(self.obs_schedule[idxes]).float().to(device), th.tensor(self.obs_ticket[idxes]).float().to(device)
+            return th.tensor(self.obs_distribution[idxes]).float().to(device), th.tensor(self.obs_chosen[idxes]).float().to(device), th.tensor(self.obs_graph[idxes]).float().to(device)
         else:
-            return self.obs_schedule[idxes], self.obs_ticket[idxes]
+            return self.obs_distribution[idxes], self.obs_chosen[idxes], self.obs_graph[idxes]
 
     def update_priorities(self, idxes, priorities):
         """Update the priorities of the experiences at idxes.
@@ -220,12 +226,14 @@ class PrioritizedReplayBuffer:
         else:
             inds = np.arange(self.size)
         tuples = (
-            self.obs_schedule[inds],
-            self.obs_ticket[inds],
+            self.obs_distribution[inds],
+            self.obs_chosen[inds],
+            self.obs_graph[inds],
             self.actions[inds],
             self.rewards[inds],
-            self.next_obs_schedule[inds],
-            self.next_obs_ticket[inds],
+            self.next_obs_distribution[inds],
+            self.next_obs_chosen[inds],
+            self.next_obs_graph[inds],
             self.dones[inds],
         )
         if to_tensor:
