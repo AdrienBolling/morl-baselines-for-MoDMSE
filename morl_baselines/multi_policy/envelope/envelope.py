@@ -200,7 +200,7 @@ class Envelope(MOPolicy, MOAgent):
         self.envelope = envelope
         self.num_sample_w = num_sample_w
         self.homotopy_lambda = self.initial_homotopy_lambda
-        self.reward_dim = 5
+        self.reward_dim = env.reward_space.shape[0]
 
         self.rand = True
 
