@@ -129,16 +129,21 @@ class PrioritizedReplayBuffer:
         self.min_priority = min_priority
 
     def add(self, obs_distribution, obs_chosen, obs_graph, action, reward, next_obs_distribution, next_obs_chosen, next_obs_graph, done, priority=None):
-        """Add a new experience to the buffer.
+
+        """
+        Add a new experience to the buffer.
 
         Args:
-            obs: Observation
+            obs_distribution: Observation distribution
+            obs_chosen: Observation chosen
+            obs_graph: Observation graph
             action: Action
             reward: Reward
-            next_obs: Next observation
+            next_obs_distribution: Next observation distribution
+            next_obs_chosen: Next observation chosen
+            next_obs_graph: Next observation graph
             done: Done
             priority: Priority of the new experience
-
         """
         self.obs_distribution[self.ptr] = np.array(obs_distribution).copy()
         self.obs_chosen[self.ptr] = np.array(obs_chosen).copy()
@@ -174,8 +179,9 @@ class PrioritizedReplayBuffer:
             self.obs_graph[idxes],
             self.actions[idxes],
             self.rewards[idxes],
-            self.next_obs_schedule[idxes],
-            self.next_obs_ticket[idxes],
+            self.next_obs_distribution[idxes],
+            self.next_obs_chosen[idxes],
+            self.next_obs_graph[idxes],
             self.dones[idxes],
         )
         if to_tensor:
