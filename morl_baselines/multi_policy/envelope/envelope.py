@@ -3,29 +3,30 @@
 Code modified to fit the MoDMSE environment
 """
 import copy
+import inspect
+import json
 import os
+from pathlib import Path
 from typing import List, Optional, Union
 
-from time import sleep
-import json
 import gymnasium as gym
 import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from pathlib import Path
+import wandb
+
+from morl_baselines.common.buffer import ReplayBuffer
 from morl_baselines.common.evaluation import (
     log_all_multi_policy_metrics,
     log_episode_info,
 )
-from morl_baselines.common.buffer import ReplayBuffer
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
 from morl_baselines.common.networks import NatureCNN, mlp, get_grad_norm, layer_init, polyak_update
 from morl_baselines.common.prioritized_buffer import PrioritizedReplayBuffer
 from morl_baselines.common.utils import linearly_decaying_value
 from morl_baselines.common.weights import equally_spaced_weights, random_weights
-import wandb
 
 
 class QNet(nn.Module):
@@ -100,36 +101,36 @@ class Envelope(MOPolicy, MOAgent):
     """
 
     def __init__(
-        self,
-        env,
-        learning_rate: float = 3e-4,
-        initial_epsilon: float = 0.01,
-        final_epsilon: float = 0.01,
-        epsilon_decay_steps: int = None,  # None == fixed epsilon
-        tau: float = 1.0,
-        target_net_update_freq: int = 50,  # ignored if tau != 1.0
-        buffer_size: int = int(1e2),
-        net_arch: List = [256, 256],
-        batch_size: int = 1, # 256
-        learning_starts: int = 100,
-        gradient_updates: int = 1,
-        gamma: float = 0.99,
-        max_grad_norm: Optional[float] = None,
-        envelope: bool = True,
-        num_sample_w: int = 1, # 4
-        per: bool = True,
-        per_alpha: float = 0.6,
-        initial_homotopy_lambda: float = 0.0,
-        final_homotopy_lambda: float = 1.0,
-        homotopy_decay_steps: int = None,
-        project_name: str = "MORL-Baselines",
-        experiment_name: str = "Envelope",
-        wandb_entity: Optional[str] = None,
-        log: bool = True,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
-        custom_qnet: Optional[nn.Module] = None,
-        action_masking: bool = False,
+            self,
+            env,
+            learning_rate: float = 3e-4,
+            initial_epsilon: float = 0.01,
+            final_epsilon: float = 0.01,
+            epsilon_decay_steps: int = None,  # None == fixed epsilon
+            tau: float = 1.0,
+            target_net_update_freq: int = 50,  # ignored if tau != 1.0
+            buffer_size: int = int(1e2),
+            net_arch: List = [256, 256],
+            batch_size: int = 1,  # 256
+            learning_starts: int = 100,
+            gradient_updates: int = 1,
+            gamma: float = 0.99,
+            max_grad_norm: Optional[float] = None,
+            envelope: bool = True,
+            num_sample_w: int = 1,  # 4
+            per: bool = True,
+            per_alpha: float = 0.6,
+            initial_homotopy_lambda: float = 0.0,
+            final_homotopy_lambda: float = 1.0,
+            homotopy_decay_steps: int = None,
+            project_name: str = "MORL-Baselines",
+            experiment_name: str = "Envelope",
+            wandb_entity: Optional[str] = None,
+            log: bool = True,
+            seed: Optional[int] = None,
+            device: Union[th.device, str] = "auto",
+            custom_qnet: Optional[nn.Module] = None,
+            action_masking: bool = False,
     ):
         """Envelope Q-learning algorithm.
 
@@ -203,8 +204,7 @@ class Envelope(MOPolicy, MOAgent):
         self.reward_dim = env.reward_space.shape[0]
 
         self.rand = True
-
-        obs = self.env.obs_to_numpy(self.env._get_obs())
+        obs = env.observation_space
 
         self.obs_shape_distribution = obs[0].shape
         self.obs_shape_chosen_val = obs[1].shape
@@ -232,7 +232,6 @@ class Envelope(MOPolicy, MOAgent):
         self.log = log
         if log:
             self.setup_wandb(project_name, experiment_name, wandb_entity)
-
 
     def get_config(self):
         return {
@@ -269,9 +268,9 @@ class Envelope(MOPolicy, MOAgent):
         """
         if not os.path.isdir(save_dir):
             os.makedirs(save_dir)
-        
-        self.q_net.save_weights(save_dir + "q_net_")
-        self.target_q_net.save_weights(save_dir + "target_q_net_")
+
+        self.q_net.save_weights(save_dir + "q_net_model_weights")
+        self.target_q_net.save_weights(save_dir + "target_q_net_model_weights")
 
         saved_params = {"q_net_optimizer_state_dict": self.q_optim.state_dict()}
         if save_replay_buffer:
@@ -286,13 +285,12 @@ class Envelope(MOPolicy, MOAgent):
             path: Path to the model.
             load_replay_buffer: Whether to load the replay buffer too.
         """
-        params = th.load(path+"envelope_params.tar")
+        params = th.load(path + "envelope_params.tar")
         self.q_net.load_weights(path + "q_net_model_weights.pth")
         self.target_q_net.load_weights(path + "target_q_net_model_weights.pth")
         self.q_optim.load_state_dict(params["q_net_optimizer_state_dict"])
         if load_replay_buffer and "replay_buffer" in params:
             self.replay_buffer = params["replay_buffer"]
-
 
     def obs_to_tensor(self, obs):
         obs_distribution = obs["validator_distribution"]
@@ -314,7 +312,6 @@ class Envelope(MOPolicy, MOAgent):
 
     def __sample_batch_experiences(self):
         return self.replay_buffer.sample(self.batch_size, to_tensor=True, device=self.device)
-
 
     def update(self):
         critic_losses = []
@@ -346,7 +343,8 @@ class Envelope(MOPolicy, MOAgent):
                 ) = self.__sample_batch_experiences()
 
             sampled_w = (
-                th.tensor(random_weights(dim=self.reward_dim, n=self.num_sample_w, dist="dirichlet", rng=self.np_random))
+                th.tensor(
+                    random_weights(dim=self.reward_dim, n=self.num_sample_w, dist="dirichlet", rng=self.np_random))
                 .float()
                 .to(self.device)
             )  # sample num_sample_w random weights
@@ -364,7 +362,8 @@ class Envelope(MOPolicy, MOAgent):
             )
             with th.no_grad():
                 if self.envelope:
-                    target = self.envelope_target(b_next_obs_distribution, b_next_obs_chosen, b_next_obs_graph, w, sampled_w)
+                    target = self.envelope_target(b_next_obs_distribution, b_next_obs_chosen, b_next_obs_graph, w,
+                                                  sampled_w)
                 else:
                     target = self.ddqn_target(b_next_obs_distribution, w)
                 target_q = b_rewards + (1 - b_dones) * self.gamma * target
@@ -438,7 +437,6 @@ class Envelope(MOPolicy, MOAgent):
             if self.per:
                 wandb.log({"metrics/mean_priority": np.mean(priority)})
 
-
     def eval(self, obs_distribution: np.ndarray, obs_chosen: np.ndarray, obs_graph: np.ndarray, w: np.ndarray) -> int:
         obs_distribution = th.as_tensor(obs_distribution).float().to(self.device)
         obs_chosen = th.as_tensor(obs_chosen).float().to(self.device)
@@ -486,13 +484,14 @@ class Envelope(MOPolicy, MOAgent):
             legal_filter = self.env.action_space.legal_filter(self.env.state)
             old_shape = scalarized_q_values.shape
             scalarized_q_values = scalarized_q_values.flatten()
-            scalarized_q_values[legal_filter == 0] = -(2**62)
+            scalarized_q_values[legal_filter == 0] = -(2 ** 62)
             scalarized_q_values = scalarized_q_values.reshape(old_shape)
         max_act = th.argmax(scalarized_q_values, dim=1)
         return max_act.detach().item()
 
     @th.no_grad()
-    def envelope_target(self, obs_distribution: th.Tensor, obs_chosen: th.Tensor, obs_graph: th.Tensor, w: th.Tensor, sampled_w: th.Tensor) -> th.Tensor:
+    def envelope_target(self, obs_distribution: th.Tensor, obs_chosen: th.Tensor, obs_graph: th.Tensor, w: th.Tensor,
+                        sampled_w: th.Tensor) -> th.Tensor:
         """Computes the envelope target for the given observation and weight.
 
         Args:
@@ -512,7 +511,8 @@ class Envelope(MOPolicy, MOAgent):
         next_obs_graph = obs_graph.unsqueeze(1).repeat(1, sampled_w.size(0), 1, 1)
 
         # Batch size X Num sampled weights X Num actions X Num objectives
-        next_q_values = self.q_net(next_obs_distribution, next_obs_chosen, next_obs_graph, W).view(obs_distribution.size(0), sampled_w.size(0), self.action_dim, self.reward_dim)
+        next_q_values = self.q_net(next_obs_distribution, next_obs_chosen, next_obs_graph, W).view(
+            obs_distribution.size(0), sampled_w.size(0), self.action_dim, self.reward_dim)
         # Scalarized Q values for each sampled weight
         scalarized_next_q_values = th.einsum("br,bwar->bwa", w, next_q_values)
         # Max Q values for each sampled weight
@@ -531,7 +531,8 @@ class Envelope(MOPolicy, MOAgent):
             ac.unsqueeze(2).unsqueeze(3).expand(next_q_values.size(0), next_q_values.size(1), 1, next_q_values.size(3)),
         ).squeeze(2)
         # Index the Q-values for the max sampled weights
-        max_next_q = max_next_q.gather(1, pref.reshape(-1, 1, 1).expand(max_next_q.size(0), 1, max_next_q.size(2))).squeeze(1)
+        max_next_q = max_next_q.gather(1, pref.reshape(-1, 1, 1).expand(max_next_q.size(0), 1,
+                                                                        max_next_q.size(2))).squeeze(1)
         return max_next_q
 
     @th.no_grad()
@@ -558,18 +559,18 @@ class Envelope(MOPolicy, MOAgent):
         return q_values_target
 
     def train(
-        self,
-        total_timesteps: int,
-        eval_env: Optional[gym.Env] = None,
-        ref_point: Optional[np.ndarray] = None,
-        known_pareto_front: Optional[List[np.ndarray]] = None,
-        weight: Optional[np.ndarray] = None,
-        total_episodes: Optional[int] = None,
-        reset_num_timesteps: bool = True,
-        eval_freq: int = 10000,
-        num_eval_weights_for_front: int = 100,
-        num_eval_episodes_for_front: int = 5,
-        reset_learning_starts: bool = False,
+            self,
+            total_timesteps: int,
+            eval_env: Optional[gym.Env] = None,
+            ref_point: Optional[np.ndarray] = None,
+            known_pareto_front: Optional[List[np.ndarray]] = None,
+            weight: Optional[np.ndarray] = None,
+            total_episodes: Optional[int] = None,
+            reset_num_timesteps: bool = True,
+            eval_freq: int = 10000,
+            num_eval_weights_for_front: int = 100,
+            num_eval_episodes_for_front: int = 5,
+            reset_learning_starts: bool = False,
     ):
         """Train the agent.
 
@@ -647,22 +648,20 @@ class Envelope(MOPolicy, MOAgent):
 
             else:
                 obs = next_obs
-    
-
 
     def train_scheduling(
-        self,
-        eval_env: Optional[gym.Env] = None,
-        ref_point: Optional[np.ndarray] = None,
-        known_pareto_front: Optional[List[np.ndarray]] = None,
-        weight: Optional[np.ndarray] = None,
-        total_schedulings: Optional[int] = None,
-        reset_num_timesteps: bool = True,
-        eval_freq: int = 10000,
-        num_eval_weights_for_front: int = 100,
-        num_eval_episodes_for_front: int = 5,
-        reset_learning_starts: bool = False,
-        exp_dir: str = "experiments",
+            self,
+            eval_env: Optional[gym.Env] = None,
+            ref_point: Optional[np.ndarray] = None,
+            known_pareto_front: Optional[List[np.ndarray]] = None,
+            weight: Optional[np.ndarray] = None,
+            total_schedulings: Optional[int] = None,
+            reset_num_timesteps: bool = True,
+            eval_freq: int = 10000,
+            num_eval_weights_for_front: int = 100,
+            num_eval_episodes_for_front: int = 5,
+            reset_learning_starts: bool = False,
+            exp_dir: str = "experiments",
     ):
         """Train the agent for scheduling.
 
@@ -696,28 +695,25 @@ class Envelope(MOPolicy, MOAgent):
         w = weight if weight is not None else random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
         tensor_w = th.tensor(w).float().to(self.device)
 
-
         # Load json conf from "experiments/exp_conf.json"
         with open('experiments/exp_conf.json') as json_file:
             exp_conf = json.load(json_file)
-        
+
         # Get the experiment name
-        exp_name = exp_conf["exp_name"]+"_"+str(exp_conf["exp_id"])
+        exp_name = exp_conf["exp_name"] + "_" + str(exp_conf["exp_id"])
 
         # Rewrite the json file with the new experiment id incermented
-        exp_conf["exp_id"] = exp_conf["exp_id"]+1
+        exp_conf["exp_id"] = exp_conf["exp_id"] + 1
         with open('experiments/exp_conf.json', 'w') as outfile:
             json.dump(exp_conf, outfile)
 
         if not os.path.isdir(exp_dir):
             os.makedirs(exp_dir)
-        
-        if not os.path.isdir(exp_dir+"/"+exp_name):
-            os.makedirs(exp_dir+"/"+exp_name)
 
+        if not os.path.isdir(exp_dir + "/" + exp_name):
+            os.makedirs(exp_dir + "/" + exp_name)
 
         env_state = self.env.state
-
 
         terminated, truncated = False, False
         # Same thing, different names for comprehension
@@ -729,24 +725,26 @@ class Envelope(MOPolicy, MOAgent):
         #     os.makedirs(exp_dir+"/"+exp_name+"/rewards")
 
         scheduling = 0
-        
+
         while scheduling < total_schedulings:
-            print("Scheduling "+ str(scheduling+1)+"/"+str(total_schedulings))
+            print("Scheduling " + str(scheduling + 1) + "/" + str(total_schedulings))
             episode_rewards = []
             rts = 0
 
-            #print("Real timesteps: "+str(rts+1)+"/"+str(total_steps)+" steps")
+            # print("Real timesteps: "+str(rts+1)+"/"+str(total_steps)+" steps")
 
             # if not os.path.isdir(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)):
             #     os.makedirs(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling))
             vec_reward = np.zeros(5)
-            while not(self.env.episode_done()) and not(terminated or truncated): # An episode is completing a whole schedule over multiple timesteps
+            while not (self.env.episode_done()) and not (
+                    terminated or truncated):  # An episode is completing a whole schedule over multiple timesteps
                 steps_rewards = []
                 self.env.get_new_tickets()
                 self.env.loop_reset()
                 ts = 0
-                while not(self.env.loop_done()) and not(terminated or truncated): # A loop is creating a whole schedule at a timestep
-                    
+                while not (self.env.loop_done()) and not (
+                        terminated or truncated):  # A loop is creating a whole schedule at a timestep
+
                     current_schedule = self.env.state['loop']['current_schedule']
                     current_step = self.env.state['loop']['current_step']
                     current_worker = self.env.state['loop']['current_worker']
@@ -761,7 +759,7 @@ class Envelope(MOPolicy, MOAgent):
                         continue
 
                     # if there was a task finishing on the previous step, we put a slack to let the worker return to station
-                    if current_schedule[current_step-1][current_worker].idx != -1:
+                    if current_schedule[current_step - 1][current_worker].idx != -1:
                         action = 0
 
                     # if we don't learn yet we just sample random actions
@@ -772,28 +770,30 @@ class Envelope(MOPolicy, MOAgent):
                         # If we are in the past we do previous actions
                         if self.env.state['episode']['current_timestep'] > self.env.state['loop']['current_step']:
                             action = 1
-                        
+
                         # If there isn't any ticket left we put a slack
                         if self.env.state['loop']['remaining_tickets_list'] == []:
                             self.env.state["loop"]["current_step"] = self.env.n_steps
-                            self.env.state["loop"]["current_worker"] = self.env.n_technicians -1
+                            self.env.state["loop"]["current_worker"] = self.env.n_technicians - 1
                             self.env.loop_pass_done()
                             continue
                         # Else we act with the agent
                         else:
-                            action = self.act(th.as_tensor(obs_schedule).float().to(self.device), th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
+                            action = self.act(th.as_tensor(obs_schedule).float().to(self.device),
+                                              th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
 
                     next_obs, vec_reward, terminated, truncated, info = self.env.step(action)
                     next_obs_schedule, next_obs_ticket = next_obs
                     self.global_step += 1
 
-                    self.replay_buffer.add(obs_schedule, obs_ticket, action, vec_reward, next_obs_schedule, next_obs_ticket, terminated)
+                    self.replay_buffer.add(obs_schedule, obs_ticket, action, vec_reward, next_obs_schedule,
+                                           next_obs_ticket, terminated)
 
                     if self.global_step >= self.learning_starts:
                         self.update()
 
                     # Evaluate the policy if needed
-                    
+
                     # if eval_env is not None and self.log and self.global_step % eval_freq == 0:
                     #     current_front = [
                     #         self.policy_eval(eval_env, weights=ew, num_episodes=num_eval_episodes_for_front, writer=None)[3]
@@ -821,9 +821,6 @@ class Envelope(MOPolicy, MOAgent):
                         obs = next_obs
                         obs_schedule, obs_ticket = obs
 
-
-                    
-
                     # If the file does not exist, create it and write the first line
 
                     # if not os.path.isfile(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)+"/rts_"+str(rts)+".csv"):
@@ -836,19 +833,19 @@ class Envelope(MOPolicy, MOAgent):
                     if self.log:
                         wandb.log(
                             {
-                                "progress/scheduling":scheduling,
-                                "progress/rts":self.env.state['episode']['current_timestep'],
+                                "progress/scheduling": scheduling,
+                                "progress/rts": self.env.state['episode']['current_timestep'],
                                 "progress/step": self.env.state['loop']['current_step'],
                                 "progress/worker": self.env.state['loop']['current_worker'],
                                 "action/action": action,
                                 "tickets/total": len(self.env.state['episode']['ticket_list']),
                                 "tickets/remaining": len(self.env.state['loop']['remaining_tickets_list']),
-                                "reward/makespan":vec_reward[0],
-                                "reward/priority":vec_reward[1],
-                                "reward/stability":vec_reward[2],
-                                "reward/robustness":vec_reward[3],
-                                "reward/timetotreatment":vec_reward[4],
-                                "reward/scalarized":np.dot(vec_reward, w),
+                                "reward/makespan": vec_reward[0],
+                                "reward/priority": vec_reward[1],
+                                "reward/stability": vec_reward[2],
+                                "reward/robustness": vec_reward[3],
+                                "reward/timetotreatment": vec_reward[4],
+                                "reward/scalarized": np.dot(vec_reward, w),
                                 "global_step": self.global_step,
                             },
                         )
@@ -856,16 +853,17 @@ class Envelope(MOPolicy, MOAgent):
 
                     self.env.loop_pass_done()
 
-                rts +=1
-                self.save(save_dir=exp_dir+"/"+exp_name+"/weights/")
+                rts += 1
+                self.save(save_dir=exp_dir + "/" + exp_name + "/weights/")
 
-                self.env.render_to_csv(save_dir=exp_dir+"/"+exp_name+"/")
-                if not Path(exp_dir+"/"+exp_name+"/rewards.csv").is_file():
-                    with open(exp_dir+"/"+exp_name+"/rewards.csv", 'w') as f:
+                self.env.render_to_csv(save_dir=exp_dir + "/" + exp_name + "/")
+                if not Path(exp_dir + "/" + exp_name + "/rewards.csv").is_file():
+                    with open(exp_dir + "/" + exp_name + "/rewards.csv", 'w') as f:
                         f.write("episode,makespan,priority,stability,robustness,timetotreatment\n")
 
-                with open(exp_dir+"/"+exp_name+"/rewards.csv", 'a') as f:
-                    f.write(str(self.env.state['episode']['current_timestep']-1)+","+(','.join(map(str, np.array(vec_reward).flatten()))+"\n"))
+                with open(exp_dir + "/" + exp_name + "/rewards.csv", 'a') as f:
+                    f.write(str(self.env.state['episode']['current_timestep'] - 1) + "," + (
+                                ','.join(map(str, np.array(vec_reward).flatten())) + "\n"))
 
             obs, _ = self.env.reset()
             obs_schedule, obs_ticket = obs
@@ -876,16 +874,15 @@ class Envelope(MOPolicy, MOAgent):
                 tensor_w = th.tensor(w).float().to(self.device)
 
             terminated, truncated = False, False
-            scheduling += 1 
+            scheduling += 1
 
-    
     def eval_scheduling_env(
-        self,
-        weight: np.ndarray = np.array([0.2, 0.2, 0.2, 0.2, 0.2]),
-        total_schedulings: int = 1,
-        exp_dir: str = "eval_experiments"
+            self,
+            weight: np.ndarray = np.array([0.2, 0.2, 0.2, 0.2, 0.2]),
+            total_schedulings: int = 1,
+            exp_dir: str = "eval_experiments"
     ):
-        
+
         '''Args:
             weight: weight vector. If None, it is randomly sampled every episode (as done in the paper).
             total_schedulings: total number of episodes to train for. If None, it is ignored.
@@ -895,7 +892,6 @@ class Envelope(MOPolicy, MOAgent):
         #     assert ref_point is not None, "Reference point must be provided for the hypervolume computation."
         # # if self.log:
         # #     self.register_additional_config({"ref_point": ref_point.tolist(), "known_front": known_pareto_front})
-
 
         num_episodes = 0
         # eval_weights = equally_spaced_weights(self.reward_dim, n=num_eval_weights_for_front)
@@ -908,36 +904,33 @@ class Envelope(MOPolicy, MOAgent):
 
         if self.log:
             self.register_additional_config({"weight":
-                                         {
-                                                "makespan": w[0],
-                                                "priority": w[1],
-                                                "stability": w[2],
-                                                "robustness": w[3],
-                                                "timetotreatment": w[4]
-                                         }})
-        
+                {
+                    "makespan": w[0],
+                    "priority": w[1],
+                    "stability": w[2],
+                    "robustness": w[3],
+                    "timetotreatment": w[4]
+                }})
 
         # Load json conf from "eval_experiments/exp_conf.json"
         with open('eval_experiments/exp_conf.json') as json_file:
             exp_conf = json.load(json_file)
-        
+
         # Get the experiment name
-        exp_name = exp_conf["exp_name"]+"_"+str(exp_conf["exp_id"])
+        exp_name = exp_conf["exp_name"] + "_" + str(exp_conf["exp_id"])
 
         # Rewrite the json file with the new experiment id incermented
-        exp_conf["exp_id"] = exp_conf["exp_id"]+1
+        exp_conf["exp_id"] = exp_conf["exp_id"] + 1
         with open('eval_experiments/exp_conf.json', 'w') as outfile:
             json.dump(exp_conf, outfile)
 
         if not os.path.isdir(exp_dir):
             os.makedirs(exp_dir)
-        
-        if not os.path.isdir(exp_dir+"/"+exp_name):
-            os.makedirs(exp_dir+"/"+exp_name)
 
+        if not os.path.isdir(exp_dir + "/" + exp_name):
+            os.makedirs(exp_dir + "/" + exp_name)
 
         env_state = self.env.state
-
 
         terminated, truncated = False, False
         # Same thing, different names for comprehension
@@ -946,20 +939,22 @@ class Envelope(MOPolicy, MOAgent):
         total_rewards = []
 
         scheduling = 0
-        
+
         while scheduling < total_schedulings:
             # print("Scheduling "+ str(scheduling+1)+"/"+str(total_schedulings))
             episode_rewards = []
             rts = 0
 
             vec_reward = np.zeros(5)
-            while not(self.env.episode_done()) and not(terminated or truncated): # An episode is completing a whole schedule over multiple timesteps
+            while not (self.env.episode_done()) and not (
+                    terminated or truncated):  # An episode is completing a whole schedule over multiple timesteps
                 steps_rewards = []
                 self.env.get_new_tickets()
                 self.env.loop_reset()
                 ts = 0
-                while not(self.env.loop_done()) and not(terminated or truncated): # A loop is creating a whole schedule at a timestep
-                    
+                while not (self.env.loop_done()) and not (
+                        terminated or truncated):  # A loop is creating a whole schedule at a timestep
+
                     current_schedule = self.env.state['loop']['current_schedule']
                     current_step = self.env.state['loop']['current_step']
                     current_worker = self.env.state['loop']['current_worker']
@@ -974,29 +969,30 @@ class Envelope(MOPolicy, MOAgent):
                         continue
 
                     # if there was a task finishing on the previous step, we put a slack to let the worker return to station
-                    if current_schedule[current_step-1][current_worker].idx != -1:
+                    if current_schedule[current_step - 1][current_worker].idx != -1:
                         action = 0
 
                     # If we are in the past we do previous actions
                     if self.env.state['episode']['current_timestep'] > self.env.state['loop']['current_step']:
                         action = 1
-                    
+
                     # If there isn't any ticket left we put a slack
                     if self.env.state['loop']['remaining_tickets_list'] == []:
                         self.env.state["loop"]["current_step"] = self.env.n_steps
-                        self.env.state["loop"]["current_worker"] = self.env.n_technicians -1
+                        self.env.state["loop"]["current_worker"] = self.env.n_technicians - 1
                         self.env.loop_pass_done()
                         continue
                     # Else we act with the agent
                     else:
-                        action = self.act(th.as_tensor(obs_schedule).float().to(self.device), th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
+                        action = self.act(th.as_tensor(obs_schedule).float().to(self.device),
+                                          th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
 
                     next_obs, vec_reward, terminated, truncated, info = self.env.step(action)
                     next_obs_schedule, next_obs_ticket = next_obs
                     self.global_step += 1
 
                     # Evaluate the policy if needed
-                    
+
                     # if eval_env is not None and self.log and self.global_step % eval_freq == 0:
                     #     current_front = [
                     #         self.policy_eval(eval_env, weights=ew, num_episodes=num_eval_episodes_for_front, writer=None)[3]
@@ -1023,32 +1019,33 @@ class Envelope(MOPolicy, MOAgent):
                     if self.log:
                         wandb.log(
                             {
-                                "progress/scheduling":scheduling,
-                                "progress/rts":self.env.state['episode']['current_timestep'],
+                                "progress/scheduling": scheduling,
+                                "progress/rts": self.env.state['episode']['current_timestep'],
                                 "progress/step": self.env.state['loop']['current_step'],
                                 "progress/worker": self.env.state['loop']['current_worker'],
                                 "action/action": action,
                                 "tickets/total": len(self.env.state['episode']['ticket_list']),
                                 "tickets/remaining": len(self.env.state['loop']['remaining_tickets_list']),
-                                "reward/makespan":vec_reward[0],
-                                "reward/priority":vec_reward[1],
-                                "reward/stability":vec_reward[2],
-                                "reward/robustness":vec_reward[3],
-                                "reward/timetotreatment":vec_reward[4],
-                                "reward/scalarized":np.dot(vec_reward, w),
+                                "reward/makespan": vec_reward[0],
+                                "reward/priority": vec_reward[1],
+                                "reward/stability": vec_reward[2],
+                                "reward/robustness": vec_reward[3],
+                                "reward/timetotreatment": vec_reward[4],
+                                "reward/scalarized": np.dot(vec_reward, w),
                                 "global_step": self.global_step,
                             },
                         )
                     ts += 1
                     self.env.loop_pass_done()
-                rts +=1
-                self.save(save_dir=exp_dir+"/"+exp_name+"/weights/")
-                self.env.render_to_csv(save_dir=exp_dir+"/"+exp_name+"/")
-                if not Path(exp_dir+"/"+exp_name+"/rewards.csv").is_file():
-                    with open(exp_dir+"/"+exp_name+"/rewards.csv", 'w') as f:
+                rts += 1
+                self.save(save_dir=exp_dir + "/" + exp_name + "/weights/")
+                self.env.render_to_csv(save_dir=exp_dir + "/" + exp_name + "/")
+                if not Path(exp_dir + "/" + exp_name + "/rewards.csv").is_file():
+                    with open(exp_dir + "/" + exp_name + "/rewards.csv", 'w') as f:
                         f.write("episode,makespan,priority,stability,robustness,timetotreatment\n")
-                with open(exp_dir+"/"+exp_name+"/rewards.csv", 'a') as f:
-                    f.write(str(self.env.state['episode']['current_timestep']-1)+","+(','.join(map(str, np.array(vec_reward).flatten()))+"\n"))
+                with open(exp_dir + "/" + exp_name + "/rewards.csv", 'a') as f:
+                    f.write(str(self.env.state['episode']['current_timestep'] - 1) + "," + (
+                                ','.join(map(str, np.array(vec_reward).flatten())) + "\n"))
 
             obs, _ = self.env.reset()
             obs_schedule, obs_ticket = obs
