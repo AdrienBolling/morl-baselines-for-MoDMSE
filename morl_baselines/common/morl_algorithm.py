@@ -51,11 +51,11 @@ class MOPolicy(ABC):
         """
 
     def __report(
-        self,
-        scalarized_return,
-        scalarized_discounted_return,
-        vec_return,
-        discounted_vec_return,
+            self,
+            scalarized_return,
+            scalarized_discounted_return,
+            vec_return,
+            discounted_vec_return,
     ):
         """Writes the data to wandb summary."""
         if self.id is None:
@@ -76,12 +76,12 @@ class MOPolicy(ABC):
             )
 
     def policy_eval(
-        self,
-        eval_env,
-        num_episodes: int = 5,
-        scalarization=np.dot,
-        weights: Optional[np.ndarray] = None,
-        log: bool = False,
+            self,
+            eval_env,
+            num_episodes: int = 5,
+            scalarization=np.dot,
+            weights: Optional[np.ndarray] = None,
+            log: bool = False,
     ):
         """Runs a policy evaluation (typically over a few episodes) on eval_env and logs some metrics if asked.
 
@@ -113,11 +113,11 @@ class MOPolicy(ABC):
         return scalarized_return, scalarized_discounted_return, vec_return, discounted_vec_return
 
     def policy_eval_esr(
-        self,
-        eval_env,
-        scalarization,
-        weights: Optional[np.ndarray] = None,
-        log: bool = False,
+            self,
+            eval_env,
+            scalarization,
+            weights: Optional[np.ndarray] = None,
+            log: bool = False,
     ):
         """Runs a policy evaluation (typically on one episode) on eval_env and logs some metrics if asked.
 
@@ -155,7 +155,8 @@ class MOPolicy(ABC):
 class MOAgent(ABC):
     """An MORL Agent, can contain one or multiple MOPolicies. Contains helpers to extract features from the environment, setup logging etc."""
 
-    def __init__(self, env: Optional[gym.Env], device: Union[th.device, str] = "auto", seed: Optional[int] = None) -> None:
+    def __init__(self, env: Optional[gym.Env], device: Union[th.device, str] = "auto",
+                 seed: Optional[int] = None) -> None:
         """Initializes the agent.
 
         Args:
@@ -243,7 +244,8 @@ class MOAgent(ABC):
             save_code=True,
         )
         # The default "step" of wandb is not the actual time step (gloabl_step) of the MDP
-        wandb.define_metric("*", step_metric="global_step")
+        # wandb.define_metric("*", step_metric="global_step")
+        wandb.define_metric("global_step")
 
     def close_wandb(self) -> None:
         """Closes the wandb writer and finishes the run."""
