@@ -189,8 +189,10 @@ class Envelope(MOPolicy, MOAgent):
             self.q_net = custom_qnet.to(self.device)
             self.target_q_net = copy.deepcopy(custom_qnet).to(self.device)
         else:
-            self.q_net = QNet(self.observation_shape, self.action_dim, self.reward_dim, net_arch=net_arch).to(self.device)
-            self.target_q_net = QNet(self.observation_shape, self.action_dim, self.reward_dim, net_arch=net_arch).to(self.device)
+            self.q_net = QNet(self.observation_shape, self.action_dim, self.reward_dim, net_arch=net_arch).to(
+                self.device)
+            self.target_q_net = QNet(self.observation_shape, self.action_dim, self.reward_dim, net_arch=net_arch).to(
+                self.device)
             self.target_q_net.load_state_dict(self.q_net.state_dict())
         for param in self.target_q_net.parameters():
             param.requires_grad = False
@@ -205,15 +207,10 @@ class Envelope(MOPolicy, MOAgent):
         self.rand = True
         obs = env.observation_space
 
-        self.obs_shape_distribution = obs[0].shape
-        self.obs_shape_chosen_val = obs[1].shape
-        self.obs_shape_graph = obs[2].shape
 
         if self.per:
             self.replay_buffer = PrioritizedReplayBuffer(
-                self.obs_shape_distribution,
-                self.obs_shape_chosen_val,
-                self.obs_shape_graph,
+                obs,
                 action_dim=1,
                 rew_dim=self.reward_dim,
                 max_size=buffer_size,
@@ -436,31 +433,36 @@ class Envelope(MOPolicy, MOAgent):
             if self.per:
                 wandb.log({"metrics/mean_priority": np.mean(priority)})
 
-    def eval(self, obs_distribution: np.ndarray, obs_chosen: np.ndarray, obs_graph: np.ndarray, w: np.ndarray) -> int:
+    def eval(self, obs: np.ndarray, w: np.ndarray) -> int:
+        obs_distribution = obs[0]
+        obs_chosen_val = obs[1]
+        obs_adj_graph = obs[2]
         obs_distribution = th.as_tensor(obs_distribution).float().to(self.device)
-        obs_chosen = th.as_tensor(obs_chosen).float().to(self.device)
-        obs_graph = th.as_tensor(obs_graph).float().to(self.device)
+        obs_chosen = th.as_tensor(obs_chosen_val).float().to(self.device)
+        obs_graph = th.as_tensor(obs_adj_graph).float().to(self.device)
 
         w = th.as_tensor(w).float().to(self.device)
         return self.max_action(obs_distribution, obs_chosen, obs_graph, w)
 
-    def act(self, obs_distribution: th.Tensor, obs_chosen: th.Tensor, obs_graph: th.Tensor, w: th.Tensor) -> int:
+    def act(self, obs: th.Tensor, w: th.Tensor) -> int:
         """Epsilon-greedily select an action given an observation and weight.
 
         Args:
-            obs_distribution: observation
-            obs_chosen: observation
-            obs_graph: observation
+            obs: observation
             w: weight vector
 
         Returns: an integer representing the action to take.
         """
+
+        obs_distribution = obs[0]
+        obs_chosen_val = obs[1]
+        obs_adj_graph = obs[2]
         if self.np_random.random() < self.epsilon:
             self.rand = True
             return self.env.action_space.sample_legal_action(self.env.state)
         else:
             self.rand = False
-            return self.max_action(obs_distribution, obs_chosen, obs_graph, w)
+            return self.max_action(obs_distribution, obs_chosen_val, obs_adj_graph, w)
 
     @th.no_grad()
     def max_action(self, obs_distribution: th.Tensor, obs_chosen: th.Tensor, obs_graph: th.Tensor, w: th.Tensor) -> int:
@@ -648,407 +650,418 @@ class Envelope(MOPolicy, MOAgent):
             else:
                 obs = next_obs
 
-    def train_scheduling(
-            self,
-            eval_env: Optional[gym.Env] = None,
-            ref_point: Optional[np.ndarray] = None,
-            known_pareto_front: Optional[List[np.ndarray]] = None,
-            weight: Optional[np.ndarray] = None,
-            total_schedulings: Optional[int] = None,
-            reset_num_timesteps: bool = True,
-            eval_freq: int = 10000,
-            num_eval_weights_for_front: int = 100,
-            num_eval_episodes_for_front: int = 5,
-            reset_learning_starts: bool = False,
-            exp_dir: str = "experiments",
-    ):
-        """Train the agent for scheduling.
-
-        Args:
-            eval_env: environment to use for evaluation. If None, it is ignored.
-            ref_point: reference point for the hypervolume computation.
-            known_pareto_front: known pareto front for the hypervolume computation.
-            weight: weight vector. If None, it is randomly sampled every episode (as done in the paper).
-            total_schedulings: total number of episodes to train for. If None, it is ignored.
-            reset_num_timesteps: whether to reset the number of timesteps. Useful when training multiple times.
-            eval_freq: policy evaluation frequency (in number of steps).
-            num_eval_weights_for_front: number of weights to sample for creating the pareto front when evaluating.
-            num_eval_episodes_for_front: number of episodes to run when evaluating the policy.
-            reset_learning_starts: whether to reset the learning starts. Useful when training multiple times.
-        """
-
-        if eval_env is not None:
-            assert ref_point is not None, "Reference point must be provided for the hypervolume computation."
-        # if self.log:
-        #     self.register_additional_config({"ref_point": ref_point.tolist(), "known_front": known_pareto_front})
-
-        self.global_step = 0 if reset_num_timesteps else self.global_step
-        self.num_episodes = 0 if reset_num_timesteps else self.num_episodes
-        if reset_learning_starts:  # Resets epsilon-greedy exploration
-            self.learning_starts = self.global_step
-
-        num_episodes = 0
-        eval_weights = equally_spaced_weights(self.reward_dim, n=num_eval_weights_for_front)
-        obs, _ = self.env.reset()
-        obs_schedule, obs_ticket = obs
-        w = weight if weight is not None else random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
-        tensor_w = th.tensor(w).float().to(self.device)
-
-        # Load json conf from "experiments/exp_conf.json"
-        with open('experiments/exp_conf.json') as json_file:
-            exp_conf = json.load(json_file)
-
-        # Get the experiment name
-        exp_name = exp_conf["exp_name"] + "_" + str(exp_conf["exp_id"])
-
-        # Rewrite the json file with the new experiment id incermented
-        exp_conf["exp_id"] = exp_conf["exp_id"] + 1
-        with open('experiments/exp_conf.json', 'w') as outfile:
-            json.dump(exp_conf, outfile)
-
-        if not os.path.isdir(exp_dir):
-            os.makedirs(exp_dir)
-
-        if not os.path.isdir(exp_dir + "/" + exp_name):
-            os.makedirs(exp_dir + "/" + exp_name)
-
-        env_state = self.env.state
-
-        terminated, truncated = False, False
-        # Same thing, different names for comprehension
-        total_steps = env_state['global']['n_steps']
-
-        total_rewards = []
-
-        # if not os.path.isdir(exp_dir+"/"+exp_name+"/rewards"):
-        #     os.makedirs(exp_dir+"/"+exp_name+"/rewards")
-
-        scheduling = 0
-
-        while scheduling < total_schedulings:
-            print("Scheduling " + str(scheduling + 1) + "/" + str(total_schedulings))
-            episode_rewards = []
-            rts = 0
-
-            # print("Real timesteps: "+str(rts+1)+"/"+str(total_steps)+" steps")
-
-            # if not os.path.isdir(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)):
-            #     os.makedirs(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling))
-            vec_reward = np.zeros(5)
-            while not (self.env.episode_done()) and not (
-                    terminated or truncated):  # An episode is completing a whole schedule over multiple timesteps
-                steps_rewards = []
-                self.env.get_new_tickets()
-                self.env.loop_reset()
-                ts = 0
-                while not (self.env.loop_done()) and not (
-                        terminated or truncated):  # A loop is creating a whole schedule at a timestep
-
-                    current_schedule = self.env.state['loop']['current_schedule']
-                    current_step = self.env.state['loop']['current_step']
-                    current_worker = self.env.state['loop']['current_worker']
-
-                    # if there's already a ticket in the current step and current worker, we don't do anything
-                    if current_schedule[current_step][current_worker].idx != -1:
-                        # put here the steps updates for the env
-                        self.env.state["loop"]["current_step"] += 1
-                        self.env.state["episode"]["current_global_step"] += 1
-                        ts += 1
-                        self.env.loop_pass_done()
-                        continue
-
-                    # if there was a task finishing on the previous step, we put a slack to let the worker return to station
-                    if current_schedule[current_step - 1][current_worker].idx != -1:
-                        action = 0
-
-                    # if we don't learn yet we just sample random actions
-                    if self.global_step < self.learning_starts:
-                        action = self.env.action_space.sample_legal_action(self.env.state)
-                    else:
-
-                        # If we are in the past we do previous actions
-                        if self.env.state['episode']['current_timestep'] > self.env.state['loop']['current_step']:
-                            action = 1
-
-                        # If there isn't any ticket left we put a slack
-                        if self.env.state['loop']['remaining_tickets_list'] == []:
-                            self.env.state["loop"]["current_step"] = self.env.n_steps
-                            self.env.state["loop"]["current_worker"] = self.env.n_technicians - 1
-                            self.env.loop_pass_done()
-                            continue
-                        # Else we act with the agent
-                        else:
-                            action = self.act(th.as_tensor(obs_schedule).float().to(self.device),
-                                              th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
-
-                    next_obs, vec_reward, terminated, truncated, info = self.env.step(action)
-                    next_obs_schedule, next_obs_ticket = next_obs
-                    self.global_step += 1
-
-                    self.replay_buffer.add(obs_schedule, obs_ticket, action, vec_reward, next_obs_schedule,
-                                           next_obs_ticket, terminated)
-
-                    if self.global_step >= self.learning_starts:
-                        self.update()
-
-                    # Evaluate the policy if needed
-
-                    # if eval_env is not None and self.log and self.global_step % eval_freq == 0:
-                    #     current_front = [
-                    #         self.policy_eval(eval_env, weights=ew, num_episodes=num_eval_episodes_for_front, writer=None)[3]
-                    #         for ew in eval_weights
-                    #     ]
-                    #     log_all_multi_policy_metrics(
-                    #         current_front=current_front,
-                    #         hv_ref_point=ref_point,
-                    #         reward_dim=self.reward_dim,
-                    #         global_step=self.global_step,
-                    #         writer=self.writer,
-                    #         ref_front=known_pareto_front,
-                    #     )
-
-                    if terminated or truncated:
-                        print("Scheduling done")
-                        obs, _ = self.env.reset()
-                        obs_schedule, obs_ticket = obs
-                        num_episodes += 1
-                        self.num_episodes += 1
-                        if weight is None:
-                            w = random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
-                            tensor_w = th.tensor(w).float().to(self.device)
-                    else:
-                        obs = next_obs
-                        obs_schedule, obs_ticket = obs
-
-                    # If the file does not exist, create it and write the first line
-
-                    # if not os.path.isfile(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)+"/rts_"+str(rts)+".csv"):
-                    #     with open(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)+"/rts_"+str(rts)+".csv", 'w') as f:
-                    #         f.write(','.join(map(str, np.array(vec_reward).flatten())))
-                    # else:
-                    # with open(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)+"/rts_"+str(rts)+".csv", 'a') as f:
-                    #     f.write(','.join(map(str, np.array(vec_reward).flatten()))+"\n")
-
-                    if self.log:
-                        wandb.log(
-                            {
-                                "progress/scheduling": scheduling,
-                                "progress/rts": self.env.state['episode']['current_timestep'],
-                                "progress/step": self.env.state['loop']['current_step'],
-                                "progress/worker": self.env.state['loop']['current_worker'],
-                                "action/action": action,
-                                "tickets/total": len(self.env.state['episode']['ticket_list']),
-                                "tickets/remaining": len(self.env.state['loop']['remaining_tickets_list']),
-                                "reward/makespan": vec_reward[0],
-                                "reward/priority": vec_reward[1],
-                                "reward/stability": vec_reward[2],
-                                "reward/robustness": vec_reward[3],
-                                "reward/timetotreatment": vec_reward[4],
-                                "reward/scalarized": np.dot(vec_reward, w),
-                                "global_step": self.global_step,
-                            },
-                        )
-                    ts += 1
-
-                    self.env.loop_pass_done()
-
-                rts += 1
-                self.save(save_dir=exp_dir + "/" + exp_name + "/weights/")
-
-                self.env.render_to_csv(save_dir=exp_dir + "/" + exp_name + "/")
-                if not Path(exp_dir + "/" + exp_name + "/rewards.csv").is_file():
-                    with open(exp_dir + "/" + exp_name + "/rewards.csv", 'w') as f:
-                        f.write("episode,makespan,priority,stability,robustness,timetotreatment\n")
-
-                with open(exp_dir + "/" + exp_name + "/rewards.csv", 'a') as f:
-                    f.write(str(self.env.state['episode']['current_timestep'] - 1) + "," + (
-                                ','.join(map(str, np.array(vec_reward).flatten())) + "\n"))
-
-            obs, _ = self.env.reset()
-            obs_schedule, obs_ticket = obs
-            num_episodes += 1
-            self.num_episodes += 1
-            if weight is None:
-                w = random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
-                tensor_w = th.tensor(w).float().to(self.device)
-
-            terminated, truncated = False, False
-            scheduling += 1
-
-    def eval_scheduling_env(
-            self,
-            weight: np.ndarray = np.array([0.2, 0.2, 0.2, 0.2, 0.2]),
-            total_schedulings: int = 1,
-            exp_dir: str = "eval_experiments"
-    ):
-
-        '''Args:
-            weight: weight vector. If None, it is randomly sampled every episode (as done in the paper).
-            total_schedulings: total number of episodes to train for. If None, it is ignored.
-        '''
-
-        # if eval_env is not None:
-        #     assert ref_point is not None, "Reference point must be provided for the hypervolume computation."
-        # # if self.log:
-        # #     self.register_additional_config({"ref_point": ref_point.tolist(), "known_front": known_pareto_front})
-
-        num_episodes = 0
-        # eval_weights = equally_spaced_weights(self.reward_dim, n=num_eval_weights_for_front)
-        obs, _ = self.env.reset()
-        obs_schedule, obs_ticket = obs
-        if weight is None:
-            weight = random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
-        w = weight
-        tensor_w = th.tensor(w).float().to(self.device)
-
-        if self.log:
-            self.register_additional_config({"weight":
-                {
-                    "makespan": w[0],
-                    "priority": w[1],
-                    "stability": w[2],
-                    "robustness": w[3],
-                    "timetotreatment": w[4]
-                }})
-
-        # Load json conf from "eval_experiments/exp_conf.json"
-        with open('eval_experiments/exp_conf.json') as json_file:
-            exp_conf = json.load(json_file)
-
-        # Get the experiment name
-        exp_name = exp_conf["exp_name"] + "_" + str(exp_conf["exp_id"])
-
-        # Rewrite the json file with the new experiment id incermented
-        exp_conf["exp_id"] = exp_conf["exp_id"] + 1
-        with open('eval_experiments/exp_conf.json', 'w') as outfile:
-            json.dump(exp_conf, outfile)
-
-        if not os.path.isdir(exp_dir):
-            os.makedirs(exp_dir)
-
-        if not os.path.isdir(exp_dir + "/" + exp_name):
-            os.makedirs(exp_dir + "/" + exp_name)
-
-        env_state = self.env.state
-
-        terminated, truncated = False, False
-        # Same thing, different names for comprehension
-        total_steps = env_state['global']['n_steps']
-
-        total_rewards = []
-
-        scheduling = 0
-
-        while scheduling < total_schedulings:
-            # print("Scheduling "+ str(scheduling+1)+"/"+str(total_schedulings))
-            episode_rewards = []
-            rts = 0
-
-            vec_reward = np.zeros(5)
-            while not (self.env.episode_done()) and not (
-                    terminated or truncated):  # An episode is completing a whole schedule over multiple timesteps
-                steps_rewards = []
-                self.env.get_new_tickets()
-                self.env.loop_reset()
-                ts = 0
-                while not (self.env.loop_done()) and not (
-                        terminated or truncated):  # A loop is creating a whole schedule at a timestep
-
-                    current_schedule = self.env.state['loop']['current_schedule']
-                    current_step = self.env.state['loop']['current_step']
-                    current_worker = self.env.state['loop']['current_worker']
-
-                    # if there's already a ticket in the current step and current worker, we don't do anything
-                    if current_schedule[current_step][current_worker].idx != -1:
-                        # put here the steps updates for the env
-                        self.env.state["loop"]["current_step"] += 1
-                        self.env.state["episode"]["current_global_step"] += 1
-                        ts += 1
-                        self.env.loop_pass_done()
-                        continue
-
-                    # if there was a task finishing on the previous step, we put a slack to let the worker return to station
-                    if current_schedule[current_step - 1][current_worker].idx != -1:
-                        action = 0
-
-                    # If we are in the past we do previous actions
-                    if self.env.state['episode']['current_timestep'] > self.env.state['loop']['current_step']:
-                        action = 1
-
-                    # If there isn't any ticket left we put a slack
-                    if self.env.state['loop']['remaining_tickets_list'] == []:
-                        self.env.state["loop"]["current_step"] = self.env.n_steps
-                        self.env.state["loop"]["current_worker"] = self.env.n_technicians - 1
-                        self.env.loop_pass_done()
-                        continue
-                    # Else we act with the agent
-                    else:
-                        action = self.act(th.as_tensor(obs_schedule).float().to(self.device),
-                                          th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
-
-                    next_obs, vec_reward, terminated, truncated, info = self.env.step(action)
-                    next_obs_schedule, next_obs_ticket = next_obs
-                    self.global_step += 1
-
-                    # Evaluate the policy if needed
-
-                    # if eval_env is not None and self.log and self.global_step % eval_freq == 0:
-                    #     current_front = [
-                    #         self.policy_eval(eval_env, weights=ew, num_episodes=num_eval_episodes_for_front, writer=None)[3]
-                    #         for ew in eval_weights
-                    #     ]
-                    #     log_all_multi_policy_metrics(
-                    #         current_front=current_front,
-                    #         hv_ref_point=ref_point,
-                    #         reward_dim=self.reward_dim,
-                    #         global_step=self.global_step,
-                    #         writer=self.writer,
-                    #         ref_front=known_pareto_front,
-                    #     )
-                    if terminated or truncated:
-                        print("Scheduling done")
-                        obs, _ = self.env.reset()
-                        obs_schedule, obs_ticket = obs
-                        num_episodes += 1
-                        self.num_episodes += 1
-                    else:
-                        obs = next_obs
-                        obs_schedule, obs_ticket = obs
-
-                    if self.log:
-                        wandb.log(
-                            {
-                                "progress/scheduling": scheduling,
-                                "progress/rts": self.env.state['episode']['current_timestep'],
-                                "progress/step": self.env.state['loop']['current_step'],
-                                "progress/worker": self.env.state['loop']['current_worker'],
-                                "action/action": action,
-                                "tickets/total": len(self.env.state['episode']['ticket_list']),
-                                "tickets/remaining": len(self.env.state['loop']['remaining_tickets_list']),
-                                "reward/makespan": vec_reward[0],
-                                "reward/priority": vec_reward[1],
-                                "reward/stability": vec_reward[2],
-                                "reward/robustness": vec_reward[3],
-                                "reward/timetotreatment": vec_reward[4],
-                                "reward/scalarized": np.dot(vec_reward, w),
-                                "global_step": self.global_step,
-                            },
-                        )
-                    ts += 1
-                    self.env.loop_pass_done()
-                rts += 1
-                self.save(save_dir=exp_dir + "/" + exp_name + "/weights/")
-                self.env.render_to_csv(save_dir=exp_dir + "/" + exp_name + "/")
-                if not Path(exp_dir + "/" + exp_name + "/rewards.csv").is_file():
-                    with open(exp_dir + "/" + exp_name + "/rewards.csv", 'w') as f:
-                        f.write("episode,makespan,priority,stability,robustness,timetotreatment\n")
-                with open(exp_dir + "/" + exp_name + "/rewards.csv", 'a') as f:
-                    f.write(str(self.env.state['episode']['current_timestep'] - 1) + "," + (
-                                ','.join(map(str, np.array(vec_reward).flatten())) + "\n"))
-
-            obs, _ = self.env.reset()
-            obs_schedule, obs_ticket = obs
-            num_episodes += 1
-            self.num_episodes += 1
-            terminated, truncated = False, False
-            scheduling += 1
+    # def train_scheduling(
+    #         self,
+    #         eval_env: Optional[gym.Env] = None,
+    #         ref_point: Optional[np.ndarray] = None,
+    #         known_pareto_front: Optional[List[np.ndarray]] = None,
+    #         weight: Optional[np.ndarray] = None,
+    #         total_schedulings: Optional[int] = None,
+    #         reset_num_timesteps: bool = True,
+    #         eval_freq: int = 10000,
+    #         num_eval_weights_for_front: int = 100,
+    #         num_eval_episodes_for_front: int = 5,
+    #         reset_learning_starts: bool = False,
+    #         exp_dir: str = "experiments",
+    # ):
+    #     """Train the agent for scheduling.
+    #
+    #     Args:
+    #         eval_env: environment to use for evaluation. If None, it is ignored.
+    #         ref_point: reference point for the hypervolume computation.
+    #         known_pareto_front: known pareto front for the hypervolume computation.
+    #         weight: weight vector. If None, it is randomly sampled every episode (as done in the paper).
+    #         total_schedulings: total number of episodes to train for. If None, it is ignored.
+    #         reset_num_timesteps: whether to reset the number of timesteps. Useful when training multiple times.
+    #         eval_freq: policy evaluation frequency (in number of steps).
+    #         num_eval_weights_for_front: number of weights to sample for creating the pareto front when evaluating.
+    #         num_eval_episodes_for_front: number of episodes to run when evaluating the policy.
+    #         reset_learning_starts: whether to reset the learning starts. Useful when training multiple times.
+    #     """
+    #
+    #     if eval_env is not None:
+    #         assert ref_point is not None, "Reference point must be provided for the hypervolume computation."
+    #     if self.log:
+    #         self.register_additional_config({"ref_point": ref_point.tolist(), "known_front": known_pareto_front})
+    #
+    #     self.global_step = 0 if reset_num_timesteps else self.global_step
+    #     self.num_episodes = 0 if reset_num_timesteps else self.num_episodes
+    #     if reset_learning_starts:  # Resets epsilon-greedy exploration
+    #         self.learning_starts = self.global_step
+    #
+    #     num_episodes = 0
+    #     eval_weights = equally_spaced_weights(self.reward_dim, n=num_eval_weights_for_front)
+    #     obs, _ = self.env.reset()
+    #     obs_schedule, obs_ticket = obs
+    #     w = weight if weight is not None else random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
+    #     tensor_w = th.tensor(w).float().to(self.device)
+    #
+    #     # Load json conf from "experiments/exp_conf.json"
+    #     with open('experiments/exp_conf.json') as json_file:
+    #         exp_conf = json.load(json_file)
+    #
+    #     # Get the experiment name
+    #     exp_name = exp_conf["exp_name"] + "_" + str(exp_conf["exp_id"])
+    #
+    #     # Rewrite the json file with the new experiment id incermented
+    #     exp_conf["exp_id"] = exp_conf["exp_id"] + 1
+    #     with open('experiments/exp_conf.json', 'w') as outfile:
+    #         json.dump(exp_conf, outfile)
+    #
+    #     if not os.path.isdir(exp_dir):
+    #         os.makedirs(exp_dir)
+    #
+    #     if not os.path.isdir(exp_dir + "/" + exp_name):
+    #         os.makedirs(exp_dir + "/" + exp_name)
+    #
+    #     env_state = self.env.state
+    #
+    #     terminated, truncated = False, False
+    #     # Same thing, different names for comprehension
+    #     total_steps = env_state['global']['n_steps']
+    #
+    #     total_rewards = []
+    #
+    #     # if not os.path.isdir(exp_dir+"/"+exp_name+"/rewards"):
+    #     #     os.makedirs(exp_dir+"/"+exp_name+"/rewards")
+    #
+    #     scheduling = 0
+    #
+    #     while scheduling < total_schedulings:
+    #         print("Scheduling " + str(scheduling + 1) + "/" + str(total_schedulings))
+    #         episode_rewards = []
+    #         rts = 0
+    #
+    #         # print("Real timesteps: "+str(rts+1)+"/"+str(total_steps)+" steps")
+    #
+    #         # if not os.path.isdir(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)):
+    #         #     os.makedirs(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling))
+    #         vec_reward = np.zeros(5)
+    #         while not (self.env.episode_done()) and not (
+    #                 terminated or truncated):  # An episode is completing a whole schedule over multiple timesteps
+    #             steps_rewards = []
+    #             self.env.get_new_tickets()
+    #             self.env.loop_reset()
+    #             ts = 0
+    #             while not (self.env.loop_done()) and not (
+    #                     terminated or truncated):  # A loop is creating a whole schedule at a timestep
+    #
+    #                 current_schedule = self.env.state['loop']['current_schedule']
+    #                 current_step = self.env.state['loop']['current_step']
+    #                 current_worker = self.env.state['loop']['current_worker']
+    #
+    #                 # if there's already a ticket in the current step and current worker, we don't do anything
+    #                 if current_schedule[current_step][current_worker].idx != -1:
+    #                     # put here the steps updates for the env
+    #                     self.env.state["loop"]["current_step"] += 1
+    #                     self.env.state["episode"]["current_global_step"] += 1
+    #                     ts += 1
+    #                     self.env.loop_pass_done()
+    #                     continue
+    #
+    #                 # if there was a task finishing on the previous step, we put a slack to let the worker return to station
+    #                 if current_schedule[current_step - 1][current_worker].idx != -1:
+    #                     action = 0
+    #
+    #                 # if we don't learn yet we just sample random actions
+    #                 if self.global_step < self.learning_starts:
+    #                     action = self.env.action_space.sample_legal_action(self.env.state)
+    #                 else:
+    #
+    #                     # If we are in the past we do previous actions
+    #                     if self.env.state['episode']['current_timestep'] > self.env.state['loop']['current_step']:
+    #                         action = 1
+    #
+    #                     # If there isn't any ticket left we put a slack
+    #                     if self.env.state['loop']['remaining_tickets_list'] == []:
+    #                         self.env.state["loop"]["current_step"] = self.env.n_steps
+    #                         self.env.state["loop"]["current_worker"] = self.env.n_technicians - 1
+    #                         self.env.loop_pass_done()
+    #                         continue
+    #                     # Else we act with the agent
+    #                     else:
+    #                         action = self.act(th.as_tensor(obs_schedule).float().to(self.device),
+    #                                           th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
+    #
+    #                 next_obs, vec_reward, terminated, truncated, info = self.env.step(action)
+    #                 next_obs_schedule, next_obs_ticket = next_obs
+    #                 self.global_step += 1
+    #
+    #                 self.replay_buffer.add(obs_schedule, obs_ticket, action, vec_reward, next_obs_schedule,
+    #                                        next_obs_ticket, terminated)
+    #
+    #                 if self.global_step >= self.learning_starts:
+    #                     self.update()
+    #
+    #                 # Evaluate the policy if needed
+    #
+    #                 if eval_env is not None and self.log and self.global_step % eval_freq == 0:
+    #                     current_front = [
+    #                         self.policy_eval(eval_env, weights=ew, num_episodes=num_eval_episodes_for_front,
+    #                                          writer=None)[3]
+    #                         for ew in eval_weights
+    #                     ]
+    #                     log_all_multi_policy_metrics(
+    #                         current_front=current_front,
+    #                         hv_ref_point=ref_point,
+    #                         reward_dim=self.reward_dim,
+    #                         global_step=self.global_step,
+    #                         writer=self.writer,
+    #                         ref_front=known_pareto_front,
+    #                     )
+    #
+    #                 if terminated or truncated:
+    #                     print("Scheduling done")
+    #                     obs, _ = self.env.reset()
+    #                     obs_schedule, obs_ticket = obs
+    #                     num_episodes += 1
+    #                     self.num_episodes += 1
+    #                     if weight is None:
+    #                         w = random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
+    #                         tensor_w = th.tensor(w).float().to(self.device)
+    #                 else:
+    #                     obs = next_obs
+    #                     obs_schedule, obs_ticket = obs
+    #
+    #                 # If the file does not exist, create it and write the first line
+    #
+    #                 # if not os.path.isfile(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)+"/rts_"+str(rts)+".csv"):
+    #                 #     with open(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)+"/rts_"+str(rts)+".csv", 'w') as f:
+    #                 #         f.write(','.join(map(str, np.array(vec_reward).flatten())))
+    #                 # else:
+    #                 # with open(exp_dir+"/"+exp_name+"/rewards/schedule_"+str(scheduling)+"/rts_"+str(rts)+".csv", 'a') as f:
+    #                 #     f.write(','.join(map(str, np.array(vec_reward).flatten()))+"\n")
+    #
+    #                 if self.log:
+    #                     wandb.log(
+    #                         {
+    #                             "progress/scheduling": scheduling,
+    #                             "progress/rts": self.env.state['episode']['current_timestep'],
+    #                             "progress/step": self.env.state['loop']['current_step'],
+    #                             "progress/worker": self.env.state['loop']['current_worker'],
+    #                             "action/action": action,
+    #                             "tickets/total": len(self.env.state['episode']['ticket_list']),
+    #                             "tickets/remaining": len(self.env.state['loop']['remaining_tickets_list']),
+    #                             "reward/makespan": vec_reward[0],
+    #                             "reward/priority": vec_reward[1],
+    #                             "reward/stability": vec_reward[2],
+    #                             "reward/robustness": vec_reward[3],
+    #                             "reward/timetotreatment": vec_reward[4],
+    #                             "reward/scalarized": np.dot(vec_reward, w),
+    #                             "global_step": self.global_step,
+    #                         },
+    #                     )
+    #                 ts += 1
+    #
+    #                 self.env.loop_pass_done()
+    #
+    #             rts += 1
+    #             self.save(save_dir=exp_dir + "/" + exp_name + "/weights/")
+    #
+    #             self.env.render_to_csv(save_dir=exp_dir + "/" + exp_name + "/")
+    #             if not Path(exp_dir + "/" + exp_name + "/rewards.csv").is_file():
+    #                 with open(exp_dir + "/" + exp_name + "/rewards.csv", 'w') as f:
+    #                     f.write("episode,makespan,priority,stability,robustness,timetotreatment\n")
+    #
+    #             with open(exp_dir + "/" + exp_name + "/rewards.csv", 'a') as f:
+    #                 f.write(str(self.env.state['episode']['current_timestep'] - 1) + "," + (
+    #                         ','.join(map(str, np.array(vec_reward).flatten())) + "\n"))
+    #
+    #         obs, _ = self.env.reset()
+    #         obs_schedule, obs_ticket = obs
+    #         num_episodes += 1
+    #         self.num_episodes += 1
+    #         if weight is None:
+    #             w = random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
+    #             tensor_w = th.tensor(w).float().to(self.device)
+    #
+    #         terminated, truncated = False, False
+    #         scheduling += 1
+    #
+    # def eval_scheduling_env(
+    #         self,
+    #         weight: np.ndarray = np.array([0.2, 0.2, 0.2, 0.2, 0.2]),
+    #         total_schedulings: int = 1,
+    #         exp_dir: str = "eval_experiments",
+    #         eval_env: Optional[gym.Env] = None,
+    #         ref_point: Optional[np.ndarray] = None,
+    #         known_pareto_front: Optional[List[np.ndarray]] = None,
+    #         reset_num_timesteps: bool = True,
+    #         eval_freq: int = 10000,
+    #         num_eval_weights_for_front: int = 100,
+    #         num_eval_episodes_for_front: int = 5,
+    #         reset_learning_starts: bool = False,
+    #
+    # ):
+    #
+    #     '''Args:
+    #         weight: weight vector. If None, it is randomly sampled every episode (as done in the paper).
+    #         total_schedulings: total number of episodes to train for. If None, it is ignored.
+    #     '''
+    #
+    #     if eval_env is not None:
+    #         assert ref_point is not None, "Reference point must be provided for the hypervolume computation."
+    #     if self.log:
+    #         self.register_additional_config({"ref_point": ref_point.tolist(), "known_front": known_pareto_front})
+    #
+    #     num_episodes = 0
+    #     eval_weights = equally_spaced_weights(self.reward_dim, n=num_eval_weights_for_front)
+    #     obs, _ = self.env.reset()
+    #     obs_schedule, obs_ticket = obs
+    #     if weight is None:
+    #         weight = random_weights(self.reward_dim, 1, dist="dirichlet", rng=self.np_random)
+    #     w = weight
+    #     tensor_w = th.tensor(w).float().to(self.device)
+    #
+    #     if self.log:
+    #         self.register_additional_config({"weight":
+    #             {
+    #                 "makespan": w[0],
+    #                 "priority": w[1],
+    #                 "stability": w[2],
+    #                 "robustness": w[3],
+    #                 "timetotreatment": w[4]
+    #             }})
+    #
+    #     # Load json conf from "eval_experiments/exp_conf.json"
+    #     with open('eval_experiments/exp_conf.json') as json_file:
+    #         exp_conf = json.load(json_file)
+    #
+    #     # Get the experiment name
+    #     exp_name = exp_conf["exp_name"] + "_" + str(exp_conf["exp_id"])
+    #
+    #     # Rewrite the json file with the new experiment id incermented
+    #     exp_conf["exp_id"] = exp_conf["exp_id"] + 1
+    #     with open('eval_experiments/exp_conf.json', 'w') as outfile:
+    #         json.dump(exp_conf, outfile)
+    #
+    #     if not os.path.isdir(exp_dir):
+    #         os.makedirs(exp_dir)
+    #
+    #     if not os.path.isdir(exp_dir + "/" + exp_name):
+    #         os.makedirs(exp_dir + "/" + exp_name)
+    #
+    #     env_state = self.env.state
+    #
+    #     terminated, truncated = False, False
+    #     # Same thing, different names for comprehension
+    #     total_steps = env_state['global']['n_steps']
+    #
+    #     total_rewards = []
+    #
+    #     scheduling = 0
+    #
+    #     while scheduling < total_schedulings:
+    #         # print("Scheduling "+ str(scheduling+1)+"/"+str(total_schedulings))
+    #         episode_rewards = []
+    #         rts = 0
+    #
+    #         vec_reward = np.zeros(5)
+    #         while not (self.env.episode_done()) and not (
+    #                 terminated or truncated):  # An episode is completing a whole schedule over multiple timesteps
+    #             steps_rewards = []
+    #             self.env.get_new_tickets()
+    #             self.env.loop_reset()
+    #             ts = 0
+    #             while not (self.env.loop_done()) and not (
+    #                     terminated or truncated):  # A loop is creating a whole schedule at a timestep
+    #
+    #                 current_schedule = self.env.state['loop']['current_schedule']
+    #                 current_step = self.env.state['loop']['current_step']
+    #                 current_worker = self.env.state['loop']['current_worker']
+    #
+    #                 # if there's already a ticket in the current step and current worker, we don't do anything
+    #                 if current_schedule[current_step][current_worker].idx != -1:
+    #                     # put here the steps updates for the env
+    #                     self.env.state["loop"]["current_step"] += 1
+    #                     self.env.state["episode"]["current_global_step"] += 1
+    #                     ts += 1
+    #                     self.env.loop_pass_done()
+    #                     continue
+    #
+    #                 # if there was a task finishing on the previous step, we put a slack to let the worker return to station
+    #                 if current_schedule[current_step - 1][current_worker].idx != -1:
+    #                     action = 0
+    #
+    #                 # If we are in the past we do previous actions
+    #                 if self.env.state['episode']['current_timestep'] > self.env.state['loop']['current_step']:
+    #                     action = 1
+    #
+    #                 # If there isn't any ticket left we put a slack
+    #                 if self.env.state['loop']['remaining_tickets_list'] == []:
+    #                     self.env.state["loop"]["current_step"] = self.env.n_steps
+    #                     self.env.state["loop"]["current_worker"] = self.env.n_technicians - 1
+    #                     self.env.loop_pass_done()
+    #                     continue
+    #                 # Else we act with the agent
+    #                 else:
+    #                     action = self.act(th.as_tensor(obs_schedule).float().to(self.device),
+    #                                       th.as_tensor(obs_ticket).float().to(self.device), tensor_w)
+    #
+    #                 next_obs, vec_reward, terminated, truncated, info = self.env.step(action)
+    #                 next_obs_schedule, next_obs_ticket = next_obs
+    #                 self.global_step += 1
+    #
+    #                 # Evaluate the policy if needed
+    #
+    #                 if eval_env is not None and self.log and self.global_step % eval_freq == 0:
+    #                     current_front = [
+    #                         self.policy_eval(eval_env, weights=ew, num_episodes=num_eval_episodes_for_front,
+    #                                          writer=None)[3]
+    #                         for ew in eval_weights
+    #                     ]
+    #                     log_all_multi_policy_metrics(
+    #                         current_front=current_front,
+    #                         hv_ref_point=ref_point,
+    #                         reward_dim=self.reward_dim,
+    #                         global_step=self.global_step,
+    #                         writer=self.writer,
+    #                         ref_front=known_pareto_front,
+    #                     )
+    #                 if terminated or truncated:
+    #                     print("Scheduling done")
+    #                     obs, _ = self.env.reset()
+    #                     obs_schedule, obs_ticket = obs
+    #                     num_episodes += 1
+    #                     self.num_episodes += 1
+    #                 else:
+    #                     obs = next_obs
+    #                     obs_schedule, obs_ticket = obs
+    #
+    #                 if self.log:
+    #                     wandb.log(
+    #                         {
+    #                             "progress/scheduling": scheduling,
+    #                             "progress/rts": self.env.state['episode']['current_timestep'],
+    #                             "progress/step": self.env.state['loop']['current_step'],
+    #                             "progress/worker": self.env.state['loop']['current_worker'],
+    #                             "action/action": action,
+    #                             "tickets/total": len(self.env.state['episode']['ticket_list']),
+    #                             "tickets/remaining": len(self.env.state['loop']['remaining_tickets_list']),
+    #                             "reward/makespan": vec_reward[0],
+    #                             "reward/priority": vec_reward[1],
+    #                             "reward/stability": vec_reward[2],
+    #                             "reward/robustness": vec_reward[3],
+    #                             "reward/timetotreatment": vec_reward[4],
+    #                             "reward/scalarized": np.dot(vec_reward, w),
+    #                             "global_step": self.global_step,
+    #                         },
+    #                     )
+    #                 ts += 1
+    #                 self.env.loop_pass_done()
+    #             rts += 1
+    #             self.save(save_dir=exp_dir + "/" + exp_name + "/weights/")
+    #             self.env.render_to_csv(save_dir=exp_dir + "/" + exp_name + "/")
+    #             if not Path(exp_dir + "/" + exp_name + "/rewards.csv").is_file():
+    #                 with open(exp_dir + "/" + exp_name + "/rewards.csv", 'w') as f:
+    #                     f.write("episode,makespan,priority,stability,robustness,timetotreatment\n")
+    #             with open(exp_dir + "/" + exp_name + "/rewards.csv", 'a') as f:
+    #                 f.write(str(self.env.state['episode']['current_timestep'] - 1) + "," + (
+    #                         ','.join(map(str, np.array(vec_reward).flatten())) + "\n"))
+    #
+    #         obs, _ = self.env.reset()
+    #         obs_schedule, obs_ticket = obs
+    #         num_episodes += 1
+    #         self.num_episodes += 1
+    #         terminated, truncated = False, False
+    #         scheduling += 1

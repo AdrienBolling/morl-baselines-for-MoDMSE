@@ -85,16 +85,14 @@ class PrioritizedReplayBuffer:
     """Prioritized Replay Buffer."""
 
     def __init__(
-        self,
-        obs_shape_distribution,
-        obs_shape_chosen,
-        obs_shape_graph,
-        action_dim = 1,
-        rew_dim=5,
-        max_size=100000,
-        obs_dtype=np.float32,
-        action_dtype=np.float32,
-        min_priority=1e-5,
+            self,
+            obs,
+            action_dim=1,
+            rew_dim=5,
+            max_size=100000,
+            obs_dtype=np.float32,
+            action_dtype=np.float32,
+            min_priority=1e-5,
     ):
         """Initialize the Prioritized Replay Buffer.
 
@@ -115,6 +113,10 @@ class PrioritizedReplayBuffer:
             0,
             0,
         )
+
+        obs_shape_distribution = obs[0].shape
+        obs_shape_chosen = obs[1].shape
+        obs_shape_graph = obs[2].shape
         self.obs_distribution = np.zeros((max_size,) + (obs_shape_distribution), dtype=obs_dtype)
         self.obs_chosen = np.zeros((max_size,) + (obs_shape_chosen), dtype=obs_dtype)
         self.obs_graph = np.zeros((max_size,) + (obs_shape_graph), dtype=obs_dtype)
@@ -128,15 +130,14 @@ class PrioritizedReplayBuffer:
         self.tree = SumTree(max_size)
         self.min_priority = min_priority
 
-    def add(self, obs_distribution, obs_chosen, obs_graph, action, reward, next_obs_distribution, next_obs_chosen, next_obs_graph, done, priority=None):
+    def add(self, obs, action, reward, next_obs_distribution, next_obs_chosen,
+            next_obs_graph, done, priority=None):
 
         """
         Add a new experience to the buffer.
 
         Args:
-            obs_distribution: Observation distribution
-            obs_chosen: Observation chosen
-            obs_graph: Observation graph
+            obs: Observation (distribution, chosen, graph)
             action: Action
             reward: Reward
             next_obs_distribution: Next observation distribution
@@ -145,6 +146,7 @@ class PrioritizedReplayBuffer:
             done: Done
             priority: Priority of the new experience
         """
+        obs_distribution, obs_chosen, obs_graph = obs[0], obs[1], obs[2]
         self.obs_distribution[self.ptr] = np.array(obs_distribution).copy()
         self.obs_chosen[self.ptr] = np.array(obs_chosen).copy()
         self.obs_graph[self.ptr] = np.array(obs_graph).copy()
@@ -202,7 +204,8 @@ class PrioritizedReplayBuffer:
         """
         idxes = self.tree.sample(batch_size)
         if to_tensor:
-            return th.tensor(self.obs_distribution[idxes]).float().to(device), th.tensor(self.obs_chosen[idxes]).float().to(device), th.tensor(self.obs_graph[idxes]).float().to(device)
+            return th.tensor(self.obs_distribution[idxes]).float().to(device), th.tensor(
+                self.obs_chosen[idxes]).float().to(device), th.tensor(self.obs_graph[idxes]).float().to(device)
         else:
             return self.obs_distribution[idxes], self.obs_chosen[idxes], self.obs_graph[idxes]
 
