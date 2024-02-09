@@ -174,7 +174,7 @@ def log_all_multi_policy_metrics(
             "eval/hypervolume": hv,
             "eval/sparsity": sp,
             "eval/eum": eum,
-            "global_step": global_step,
+            "global_outer_step": global_step,
         },
         commit=False,
     )
