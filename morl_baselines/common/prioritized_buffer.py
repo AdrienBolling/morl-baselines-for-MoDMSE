@@ -130,8 +130,7 @@ class PrioritizedReplayBuffer:
         self.tree = SumTree(max_size)
         self.min_priority = min_priority
 
-    def add(self, obs, action, reward, next_obs_distribution, next_obs_chosen,
-            next_obs_graph, done, priority=None):
+    def add(self, obs, action, reward, next_obs, done, priority=None):
 
         """
         Add a new experience to the buffer.
@@ -140,13 +139,12 @@ class PrioritizedReplayBuffer:
             obs: Observation (distribution, chosen, graph)
             action: Action
             reward: Reward
-            next_obs_distribution: Next observation distribution
-            next_obs_chosen: Next observation chosen
-            next_obs_graph: Next observation graph
+            next_obs: Next observation distribution, chosen, graph
             done: Done
             priority: Priority of the new experience
         """
         obs_distribution, obs_chosen, obs_graph = obs[0], obs[1], obs[2]
+        next_obs_distribution, next_obs_chosen, next_obs_graph = next_obs[0], next_obs[1], next_obs[2]
         self.obs_distribution[self.ptr] = np.array(obs_distribution).copy()
         self.obs_chosen[self.ptr] = np.array(obs_chosen).copy()
         self.obs_graph[self.ptr] = np.array(obs_graph).copy()
