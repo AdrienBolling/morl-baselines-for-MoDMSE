@@ -14,7 +14,6 @@ from morl_baselines_modmse.common.morl_algorithm import MOPolicy
 from morl_baselines_modmse.common.performance_indicators import hypervolume
 from morl_baselines_modmse.common.weights import extrema_weights
 
-
 np.set_printoptions(precision=4)
 
 
@@ -31,10 +30,10 @@ class LinearSupport:
     """
 
     def __init__(
-        self,
-        num_objectives: int,
-        epsilon: float = 0.0,
-        verbose: bool = True,
+            self,
+            num_objectives: int,
+            epsilon: float = 0.0,
+            verbose: bool = True,
     ):
         """Initialize Linear Support.
 
@@ -55,7 +54,7 @@ class LinearSupport:
             self.queue.append((float("inf"), w))
 
     def next_weight(
-        self, algo: str = "ols", gpi_agent: Optional[MOPolicy] = None, env: Optional[Env] = None, rep_eval: int = 1
+            self, algo: str = "ols", gpi_agent: Optional[MOPolicy] = None, env: Optional[Env] = None, rep_eval: int = 1
     ) -> np.ndarray:
         """Returns the next weight vector with highest priority.
 
@@ -70,6 +69,7 @@ class LinearSupport:
         """
         if len(self.ccs) > 0:
             W_corner = self.compute_corner_weights()
+            W_corner = np.array(W_corner, dtype=np.float32)
             if self.verbose:
                 print("W_corner:", W_corner, "W_corner size:", len(W_corner))
 
@@ -374,6 +374,7 @@ if __name__ == "__main__":
 
     def _solve(w):
         return np.array(list(map(float, input().split())), dtype=np.float32)
+
 
     num_objectives = 3
     ols = LinearSupport(num_objectives=num_objectives, epsilon=0.0001, verbose=True)

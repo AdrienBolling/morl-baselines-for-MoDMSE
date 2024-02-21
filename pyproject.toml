@@ -29,6 +29,7 @@ dependencies = [
     "scipy >=1.7.3",
     "pymoo >=0.6.0",
     "wandb >=0.14.0",
+    "pycddlib >=2.0.0",
     "imageio",
     "moviepy",
     "seaborn",
