@@ -691,7 +691,8 @@ class GPIPD(MOPolicy, MOAgent):
             e = min((i + 1) * 1000, obs_s.shape[0])
             obs, actions, rewards, next_obs, dones = obs_s[b:e], actions_s[b:e], rewards_s[b:e], next_obs_s[
                                                                                                  b:e], dones_s[b:e]
-            w = np.repeat(w, obs.shape[0], axis=0)
+            w = np.repeat(w[np.newaxis, :], obs.shape[0], axis=0)
+            actions = th.tensor(actions).to(self.device)
             q_values = self.q_nets[0](obs, w)
             q_a = q_values.gather(1, actions.long().reshape(-1, 1, 1).expand(q_values.size(0), 1,
                                                                              q_values.size(2))).squeeze(1)
@@ -701,7 +702,9 @@ class GPIPD(MOPolicy, MOAgent):
                 max_next_q, _ = self._envelope_target(next_obs, w, self.weight_support)
             else:
                 next_q_values = self.q_nets[0](next_obs, w)
-                max_q = th.einsum("r,bar->ba", w_ten, next_q_values)
+                # max_q = th.einsum("r,bar->ba", w_ten, next_q_values)
+                # TODO I have a bug here when I run the code
+                max_q = th.einsum("rba,ra->b", next_q_values, w_ten)  # solution provided by ChatGPT
                 max_acts = th.argmax(max_q, dim=1)
                 q_targets = self.target_q_nets[0](next_obs, w)
                 q_targets = q_targets.gather(
