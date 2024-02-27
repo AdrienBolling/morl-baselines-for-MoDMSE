@@ -675,7 +675,7 @@ class GPIPD(MOPolicy, MOAgent):
         return max_act.detach().item()
 
     @th.no_grad()
-    def _reset_priorities(self, w: np.ndarray):
+    def _reset_priorities(self, w_init: np.ndarray):
         inds = np.arange(self.replay_buffer.size)
         priorities = np.repeat(0.1, self.replay_buffer.size)
         (
@@ -691,27 +691,28 @@ class GPIPD(MOPolicy, MOAgent):
             e = min((i + 1) * 1000, obs_s.shape[0])
             obs, actions, rewards, next_obs, dones = obs_s[b:e], actions_s[b:e], rewards_s[b:e], next_obs_s[
                                                                                                  b:e], dones_s[b:e]
-            w = np.repeat(w[np.newaxis, :], obs.shape[0], axis=0)
-            actions = th.tensor(actions).to(self.device)
+            w = np.repeat(w_init[np.newaxis, :], obs.shape[0], axis=0)
+            actions, rewards, dones = (
+                th.tensor(actions).to(self.device),
+                th.tensor(rewards).to(self.device),
+                th.tensor(dones).to(self.device),
+            )
             q_values = self.q_nets[0](obs, w)
             q_a = q_values.gather(1, actions.long().reshape(-1, 1, 1).expand(q_values.size(0), 1,
                                                                              q_values.size(2))).squeeze(1)
 
-            w_ten = th.tensor(w).to(self.device)
+            w_ten = th.tensor(w_init).to(self.device)
             if self.gpi_pd:
                 max_next_q, _ = self._envelope_target(next_obs, w, self.weight_support)
             else:
                 next_q_values = self.q_nets[0](next_obs, w)
-                # max_q = th.einsum("r,bar->ba", w_ten, next_q_values)
-                # TODO I have a bug here when I run the code
-                max_q = th.einsum("rba,ra->b", next_q_values, w_ten)  # solution provided by ChatGPT
+                max_q = th.einsum("r,bar->ba", w_ten, next_q_values)
                 max_acts = th.argmax(max_q, dim=1)
                 q_targets = self.target_q_nets[0](next_obs, w)
                 q_targets = q_targets.gather(
                     1, max_acts.long().reshape(-1, 1, 1).expand(q_targets.size(0), 1, q_targets.size(2))
                 )
                 max_next_q = q_targets.reshape(-1, self.reward_dim)
-
             gtderror = th.einsum("r,br->b", w_ten, (rewards + (1 - dones) * self.gamma * max_next_q - q_a)).abs()
             priorities[b:e] = gtderror.clamp(min=self.min_priority).pow(self.alpha).cpu().detach().numpy().flatten()
 
